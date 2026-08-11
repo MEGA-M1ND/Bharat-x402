@@ -435,6 +435,35 @@ class Ledger:
 
     # -- reporting ---------------------------------------------------------
 
+    def revenue_below(self, amount_paise: int, settle_date: str | None = None) -> dict:
+        """Revenue made up of individually-too-small charges.
+
+        The headline number in the publisher's report: money that per-request
+        settlement could not have collected at any price, because each charge
+        sits under the payment gateway's floor.
+
+        Computed from the actual commitment rows rather than inferred from
+        per-agent averages. An agent that fetches both a ₹5 report and forty
+        ₹0.50 API calls has a mean above the floor while forty of its
+        forty-one charges are below it, so an average would understate this
+        badly.
+
+        Args:
+            amount_paise: The floor to compare against.
+            settle_date: Day to inspect. Defaults to today UTC.
+
+        Returns:
+            `{"count": ..., "totalPaise": ...}` for commitments under the floor.
+        """
+        settle_date = settle_date or today_utc()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(amount_paise), 0) AS total"
+                " FROM commitments WHERE settle_date = ? AND amount_paise < ?",
+                (settle_date, int(amount_paise)),
+            ).fetchone()
+        return {"count": row["count"], "totalPaise": row["total"]}
+
     def daily_summary(self, settle_date: str | None = None) -> dict:
         """Aggregates one day's activity for the publisher's report.
 
