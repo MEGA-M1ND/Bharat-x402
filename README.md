@@ -21,12 +21,37 @@ without touching stablecoin infrastructure.
 ## Status
 
 - [x] Phase 0 — repo skeleton, env templates, docker-compose
-- [ ] Phase 1 — resource server with x402 gate
+- [x] Phase 1 — resource server with x402 gate
 - [ ] Phase 2 — Razorpay facilitator (`/verify`, `/settle`, `/settle-batch`)
 - [ ] Phase 3 — demo crawler agent
 - [ ] Phase 4 — batch settlement + daily summary
 - [ ] Phase 5 — tests
 - [ ] Phase 6 — documentation
+
+## This is a real x402 deployment, not a lookalike
+
+The resource server runs the stock `@x402/express` middleware. x402 separates the
+*scheme* (how a payment is proven), the *network* (where it settles), and the
+*facilitator* (who settles it) — and all three are open extension points:
+`Network` is typed `` `${string}:${string}` ``, and `FacilitatorClient` /
+`SchemeNetworkServer` are plain interfaces.
+
+So this project registers a `razorpay-inr` scheme on network `razorpay:inr-test`
+and points the middleware's facilitator client at a FastAPI service that speaks the
+standard facilitator contract (`GET /supported`, `POST /verify`, `POST /settle`).
+No part of the protocol is reimplemented or stubbed.
+
+An unpaid request today:
+
+```
+HTTP 402 Payment Required
+PAYMENT-REQUIRED: <base64>   ← {"x402Version":2, "accepts":[{"scheme":"razorpay-inr",
+                                 "network":"razorpay:inr-test","asset":"INR",
+                                 "amount":"500", ...}]}
+```
+
+`amount` is in **paise**, exactly as USDC amounts travel in atomic 1e-6 units.
+₹5.00 → `"500"`. No float ever touches a monetary value.
 
 ## Test mode only
 
