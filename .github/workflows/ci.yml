@@ -160,6 +160,25 @@ jobs:
           python demo-agent/crawler_agent.py
           python demo-agent/crawler_agent.py --count 5 --agent-id agent-ci-crawler
 
+      # The scheduler must be safe to run more often than needed: a second run
+      # with nothing pending has to be a no-op, or it will eventually
+      # double-charge someone.
+      - name: Scheduler settles, then no-ops
+        run: |
+          python facilitator/scheduler.py --once --dry-run
+          python facilitator/scheduler.py --once | tee /tmp/settle.json
+          grep -q '"event": "settlement_run"' /tmp/settle.json
+
+          python facilitator/scheduler.py --once | tee /tmp/settle2.json
+          grep -q '"event": "settlement_noop"' /tmp/settle2.json
+
+      # A revenue report that overstates is worse than no report, so this
+      # checks the money agrees with itself rather than that the script ran.
+      - name: Publisher digest reconciles
+        env:
+          LEDGER_DB_PATH: facilitator/data/ledger.db
+        run: python tests/ci_digest.py
+
       - name: Dump service logs
         if: always()
         run: |

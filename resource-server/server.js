@@ -149,15 +149,38 @@ resourceServer.onSettleFailure(async ({ requirements, error }) => {
 const routes = buildRoutes({ payTo: PAY_TO, price: PRICE, facilitatorUrl: FACILITATOR_URL });
 
 /**
- * Mount the gate. The middleware calls `GET /supported` on the facilitator at
- * startup to confirm it actually handles razorpay-inr on razorpay:inr-test.
+ * The payment gate, created once the facilitator is known to be answering.
  *
- * This is mounted unconditionally and before the protected handler. If the
- * facilitator is unreachable the middleware fails the request — it never falls
- * through to serving paid content for free, which is the one failure mode a
- * paywall must not have.
+ * Why it is deferred rather than built here: `paymentMiddleware()` fires its
+ * own `GET /supported` at *construction* time and caches the resulting
+ * promise. Build it before the facilitator is up and that cached promise is
+ * already rejected, so the first paid request fails with a 500 and only the
+ * second one recovers. Under `docker compose up`, where both services start
+ * together, that is the very first request a user makes.
  */
-app.use(paymentMiddleware(routes, resourceServer));
+let paymentGate = null;
+
+/**
+ * Permanent guard, registered now so it always sits in front of the protected
+ * handler regardless of when the gate itself becomes available.
+ *
+ * Registration order is what enforces the paywall in Express: a route
+ * registered before its guard is a route served for free. So the guard goes in
+ * at module load and delegates to the gate once there is one — and refuses the
+ * request outright while there is not.
+ */
+app.use((req, res, next) => {
+  if (paymentGate) {
+    return paymentGate(req, res, next);
+  }
+  // Fail closed. Serving paid content because settlement is not ready yet is
+  // the one mistake a paywall cannot make.
+  log("gate_not_ready", { path: req.path });
+  return res.status(503).json({
+    error: "settlement_unavailable",
+    message: "Payment settlement is not ready yet. Try again shortly.",
+  });
+});
 
 /**
  * Waits for the facilitator to answer `GET /supported`.
@@ -255,11 +278,19 @@ app.use((err, _req, res, _next) => {
  */
 async function start() {
   const ready = await waitForFacilitator();
+
+  // Build the gate only now, so its startup /supported call lands on a
+  // facilitator that is actually listening.
+  paymentGate = paymentMiddleware(routes, resourceServer);
+
   if (!ready) {
-    // Start anyway: better to serve 502s on the paid route and keep the free
-    // routes up than to take the whole publisher offline because settlement
-    // is down. The gate stays mounted either way.
-    console.warn(`[resource-server] facilitator at ${FACILITATOR_URL} did not respond — paid routes will fail until it does`);
+    // Start anyway: better to fail the paid route and keep the free routes up
+    // than to take the whole publisher offline because settlement is down.
+    // The guard is registered either way, so nothing is served unpaid.
+    console.warn(
+      `[resource-server] facilitator at ${FACILITATOR_URL} did not respond — ` +
+        "paid routes will fail until it does"
+    );
   }
 
   app.listen(PORT, () => {
