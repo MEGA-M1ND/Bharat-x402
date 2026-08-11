@@ -1,0 +1,51 @@
+# Runs the publisher's resource server and the INR facilitator together.
+# The demo agent is deliberately left out — you run it from the host so you can
+# watch the 402 negotiation in your own terminal.
+#
+#   docker compose up --build
+#   curl http://localhost:3402/premium/market-report
+#
+# Both services read secrets from their own .env file (copy from .env.example).
+# Nothing here should ever hold a live Razorpay key.
+
+services:
+  facilitator:
+    build:
+      context: ./facilitator
+    container_name: bharat-x402-facilitator
+    env_file:
+      - ./facilitator/.env
+    environment:
+      # Inside the compose network the ledger lives on a named volume so it
+      # survives restarts and the reporting script can be pointed at it.
+      LEDGER_DB_PATH: /data/ledger.db
+      PORT: 8402
+    ports:
+      - "8402:8402"
+    volumes:
+      - facilitator-ledger:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8402/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  resource-server:
+    build:
+      context: ./resource-server
+    container_name: bharat-x402-resource-server
+    env_file:
+      - ./resource-server/.env
+    environment:
+      PORT: 3402
+      # Service-to-service, not localhost: the resource server talks to the
+      # facilitator over the compose network.
+      FACILITATOR_URL: http://facilitator:8402
+    ports:
+      - "3402:3402"
+    depends_on:
+      facilitator:
+        condition: service_healthy
+
+volumes:
+  facilitator-ledger:

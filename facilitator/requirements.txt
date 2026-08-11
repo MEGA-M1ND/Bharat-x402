@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-dotenv==1.0.1
+# 2.x drops the pkg_resources import that 1.4.x still carries, which breaks on
+# Python 3.12 installs without setuptools.
+razorpay==2.0.1
+httpx==0.28.1
