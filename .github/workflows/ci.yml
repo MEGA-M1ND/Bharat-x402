@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch — no value in testing a commit
+# that has already been pushed past.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Facilitator + tests (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r facilitator/requirements.txt
+          pip install -r demo-agent/requirements.txt
+          pip install pytest ruff
+
+      - name: Lint
+        run: ruff check facilitator demo-agent reporting tests
+
+      - name: Test
+        run: pytest tests -v
+
+  node:
+    name: Resource server (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: resource-server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: resource-server
+        run: npm ci
+
+      - name: Syntax check
+        working-directory: resource-server
+        run: |
+          node --check server.js
+          node --check x402-config.js
+
+  smoke:
+    name: End-to-end 402 smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: resource-server/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          pip install -r facilitator/requirements.txt -r demo-agent/requirements.txt
+          npm --prefix resource-server ci
+
+      # No secrets in CI: MOCK_RAZORPAY keeps the facilitator from making any
+      # outbound API call, so the full flow runs without a Razorpay account.
+      - name: Configure services
+        run: |
+          cp facilitator/.env.example facilitator/.env
+          cp resource-server/.env.example resource-server/.env
+          cp demo-agent/.env.example demo-agent/.env
+
+      - name: Start facilitator
+        run: |
+          cd facilitator
+          nohup python -m uvicorn main:app --port 8402 > /tmp/facilitator.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8402/health && break
+            sleep 1
+          done
+          curl -sf http://localhost:8402/supported | tee /dev/stderr | grep -q 'razorpay-inr'
+
+      - name: Start resource server
+        run: |
+          cd resource-server
+          nohup node server.js > /tmp/resource-server.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:3402/health && break
+            sleep 1
+          done
+
+      # The core assertion of the whole project: an unpaid agent request is
+      # answered with a spec-shaped 402 denominated in paise, pointing at an
+      # INR facilitator rather than an EVM one.
+      - name: Unpaid request returns a 402 with an INR offer
+        run: |
+          status=$(curl -s -o /tmp/402.json -D /tmp/402.headers -w '%{http_code}' \
+            http://localhost:3402/premium/market-report)
+          echo "status=$status"
+          test "$status" = "402"
+
+          offer=$(grep -i '^payment-required:' /tmp/402.headers | cut -d' ' -f2- | tr -d '\r' | base64 -d)
+          echo "$offer" | python -m json.tool
+
+          echo "$offer" | python -c '
+          import json, sys
+          required = json.load(sys.stdin)
+          assert required["x402Version"] == 2, required
+          accepts = required["accepts"]
+          assert len(accepts) == 1, accepts
+          offer = accepts[0]
+          assert offer["scheme"] == "razorpay-inr", offer
+          assert offer["network"] == "razorpay:inr-test", offer
+          assert offer["asset"] == "INR", offer
+          assert offer["amount"] == "500", offer  # paise, not rupees
+          print("402 offer OK:", offer["extra"]["humanAmount"])
+          '
+
+      - name: Free route stays free
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:3402/free/market-report-preview)
+          test "$status" = "200"
+
+      - name: Dump service logs
+        if: always()
+        run: |
+          echo "--- facilitator ---"; cat /tmp/facilitator.log || true
+          echo "--- resource server ---"; cat /tmp/resource-server.log || true
