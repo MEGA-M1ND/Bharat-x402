@@ -151,6 +151,15 @@ jobs:
       - name: Batch settlement reconciles against the ledger
         run: python tests/ci_batch_flow.py
 
+      # The demo agent is what a reviewer runs first, so a broken one is worse
+      # than a broken internal. NO_COLOR keeps the log readable.
+      - name: Demo agent completes the negotiation
+        env:
+          NO_COLOR: "1"
+        run: |
+          python demo-agent/crawler_agent.py
+          python demo-agent/crawler_agent.py --count 5 --agent-id agent-ci-crawler
+
       - name: Dump service logs
         if: always()
         run: |
