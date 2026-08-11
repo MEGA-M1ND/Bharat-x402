@@ -141,6 +141,16 @@ jobs:
             http://localhost:3402/free/market-report-preview)
           test "$status" = "200"
 
+      # The whole point, asserted end to end: quote an offer, sign acceptance,
+      # present it, get the content and a settlement receipt back.
+      - name: Paid request unlocks the resource
+        run: python tests/ci_paid_flow.py
+
+      # Batching is the project's actual contribution, so CI checks the money
+      # reconciles rather than trusting the endpoint returned 200.
+      - name: Batch settlement reconciles against the ledger
+        run: python tests/ci_batch_flow.py
+
       - name: Dump service logs
         if: always()
         run: |
