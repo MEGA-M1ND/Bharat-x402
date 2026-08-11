@@ -1,0 +1,35 @@
+# Tooling config for the Python services. There is no Python package to build
+# here — this file exists so `ruff` and `pytest` behave identically on a
+# developer's machine and in CI.
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv", "data"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes — unused imports, undefined names
+    "I",   # import sorting
+    "UP",  # pyupgrade — modern syntax for the target version
+    "B",   # bugbear — likely bugs rather than style
+]
+ignore = [
+    # `except Exception` around the Razorpay call is deliberate: a settlement
+    # failure must be recorded and reported, never allowed to escape and take
+    # the batch run down with it. Every such handler logs the exception type
+    # and message.
+    "BLE001",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Services import their siblings by bare module name (`from ledger import ...`),
+# so the facilitator directory has to be importable from the test process.
+pythonpath = ["facilitator", "demo-agent", "reporting"]
+filterwarnings = [
+    # FastAPI's on_event is deprecated in favour of lifespan handlers; the
+    # deprecation is noisy and the migration is not worth it for one hook.
+    "ignore::DeprecationWarning",
+]

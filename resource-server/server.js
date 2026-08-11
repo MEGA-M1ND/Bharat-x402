@@ -61,10 +61,23 @@ app.use(express.json());
  * middleware reads. Costs three lines and means an agent written against
  * either generation of the docs works against this server.
  */
-app.use((req, _res, next) => {
+app.use((req, res, next) => {
   if (!req.headers["payment-signature"] && req.headers["x-payment"]) {
     req.headers["payment-signature"] = req.headers["x-payment"];
   }
+
+  // Same split in the response direction: the settlement receipt goes out as
+  // `PAYMENT-RESPONSE` in v2 and `X-PAYMENT-RESPONSE` in v1. Mirror it so a
+  // client of either generation can read its receipt. Wrapping setHeader is
+  // the least invasive way to catch a header the middleware sets later.
+  const originalSetHeader = res.setHeader.bind(res);
+  res.setHeader = function (name, value) {
+    if (String(name).toLowerCase() === "payment-response") {
+      originalSetHeader("X-PAYMENT-RESPONSE", value);
+    }
+    return originalSetHeader(name, value);
+  };
+
   next();
 });
 
