@@ -39,6 +39,54 @@ jobs:
       - name: Unit and service tests
         run: pytest tests -v
 
+  postgres:
+    name: Facilitator + tests (Postgres)
+    runs-on: ubuntu-latest
+    # The actual proof that facilitator/db.py's dialect shim didn't quietly
+    # break the money-handling code it sits in front of: every test that
+    # touches the ledger (via the `ledger`, `client`, and `facilitator_app`
+    # fixtures) runs unmodified against a real Postgres instead of SQLite.
+    # TestIntegration and TestDemoApi skip here — no live services are
+    # started in this job, which is correct, since those tests exercise the
+    # Node<->Python HTTP contract, not the database engine.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bharatx402
+          POSTGRES_PASSWORD: bharatx402
+          POSTGRES_DB: bharatx402_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_LEDGER_DSN: postgresql://bharatx402:bharatx402@localhost:5432/bharatx402_test
+      # Belt and braces: the ledger_path fixture already creates the schema
+      # itself before every test (the container starts genuinely empty), but
+      # this documents the intent for anyone who later points a live
+      # facilitator process at this same database outside of pytest.
+      LEDGER_AUTO_MIGRATE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r facilitator/requirements.txt
+          pip install pytest
+
+      - name: Full test suite against real Postgres
+        run: pytest tests -v
+
   node:
     name: Resource server (Node)
     runs-on: ubuntu-latest

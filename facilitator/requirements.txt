@@ -6,3 +6,12 @@ python-dotenv==1.0.1
 # Python 3.12 installs without setuptools.
 razorpay==2.0.1
 httpx==0.28.1
+
+# Ledger backend for production (Postgres, via db.py's dialect shim). Always
+# installed and imported — db.py imports psycopg unconditionally — but only
+# ever *connects* when a postgres:// DSN is actually used; local dev and
+# tests run on plain SQLite regardless.
+# [binary] avoids a C-compile step in constrained build environments (Vercel,
+# CI) at the cost of a slightly larger wheel.
+psycopg[binary]==3.2.13
+psycopg-pool==3.2.8

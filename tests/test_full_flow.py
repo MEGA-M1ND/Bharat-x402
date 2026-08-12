@@ -195,6 +195,57 @@ class TestOfferPolicy:
 # ---------------------------------------------------------------------------
 
 
+class TestDbShim:
+    """facilitator/db.py — the SQLite/Postgres dialect translation itself."""
+
+    def test_postgres_placeholders_translate(self):
+        from db import _to_postgres_placeholders
+
+        assert _to_postgres_placeholders("SELECT * FROM t WHERE a = ? AND b = ?") == (
+            "SELECT * FROM t WHERE a = %s AND b = %s"
+        )
+
+    def test_split_sql_statements_does_not_break_on_a_comment_containing_a_semicolon(self):
+        """Regression test for a real CI failure, not a hypothetical one.
+
+        A DDL comment that happens to contain an English semicolon —
+        "...ever updated or deleted; it is the audit trail..." — used to
+        split the script mid-sentence. Postgres was then handed a fragment
+        starting with "it is the", with no `--` in front of it, which is a
+        syntax error rather than a comment. Caught by the real postgres:16
+        CI job, not by any local reasoning about the splitter.
+        """
+        from db import _split_sql_statements
+
+        script = (
+            "-- a comment; with a semicolon in it\n"
+            "CREATE TABLE a (x INT);\n"
+            "-- another; one; with several\n"
+            "CREATE TABLE b (y INT);"
+        )
+        statements = _split_sql_statements(script)
+        assert statements == ["CREATE TABLE a (x INT)", "CREATE TABLE b (y INT)"]
+
+    def test_split_sql_statements_against_the_real_schema(self):
+        """The actual schema, not a synthetic example — six statements, none
+        of them a comment fragment."""
+        from db import _split_sql_statements
+        from ledger import schema_sql
+
+        statements = _split_sql_statements(schema_sql("postgres"))
+        assert len(statements) == 6
+        for statement in statements:
+            assert statement.upper().startswith(("CREATE TABLE", "CREATE INDEX")), statement
+
+    def test_dialect_for(self):
+        from db import dialect_for
+
+        assert dialect_for("postgres://u:p@host/db") == "postgres"
+        assert dialect_for("postgresql://u:p@host/db") == "postgres"
+        assert dialect_for("./data/ledger.db") == "sqlite"
+        assert dialect_for("/absolute/path/ledger.db") == "sqlite"
+
+
 class TestLedger:
     def _store_offer(self, ledger: Ledger, agent_id: str, amount: int = PRICE_PAISE) -> dict:
         offer = build_offer(
