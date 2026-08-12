@@ -21,7 +21,10 @@
 
 "use strict";
 
-require("dotenv").config();
+// Load this service's own .env, not whatever happens to sit in the working
+// directory. `node resource-server/server.js` from the repo root is the
+// obvious way to start it, and dotenv's default would silently find nothing.
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 
 const express = require("express");
 const { paymentMiddleware, x402ResourceServer } = require("@x402/express");
