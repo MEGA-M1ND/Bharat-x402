@@ -464,22 +464,33 @@ class Ledger:
             ).fetchone()
         return {"count": row["count"], "totalPaise": row["total"]}
 
-    def daily_summary(self, settle_date: str | None = None) -> dict:
+    def daily_summary(self, settle_date: str | None = None, agent_id: str | None = None) -> dict:
         """Aggregates one day's activity for the publisher's report.
+
+        `agent_id` exists for the console UI: with several visitors hitting a
+        shared deployment, an unfiltered summary is everyone's revenue mixed
+        together, and an unfiltered `batches` list lets one visitor see (and
+        via `/settle-batch`, sweep) another's pending commitments. Every
+        caller that predates the console — `reporting/daily_summary.py`, the
+        CI flow scripts, this method's own tests — passes no `agent_id` and
+        sees exactly what they saw before.
 
         Args:
             settle_date: Day to summarise, YYYY-MM-DD. Defaults to today UTC.
+            agent_id: Narrow to one agent. Omit for the whole day.
 
         Returns:
             Totals, per-agent breakdown, and the batches generated.
         """
         settle_date = settle_date or today_utc()
+        agent_filter = " AND agent_id = ?" if agent_id else ""
+        params: tuple = (settle_date, agent_id) if agent_id else (settle_date,)
 
         with self._connect() as conn:
             totals = conn.execute(
                 "SELECT COUNT(*) AS requests, COALESCE(SUM(amount_paise), 0) AS total_paise"
-                " FROM commitments WHERE settle_date = ?",
-                (settle_date,),
+                f" FROM commitments WHERE settle_date = ?{agent_filter}",
+                params,
             ).fetchone()
 
             by_agent = conn.execute(
@@ -487,32 +498,34 @@ class Ledger:
                 " COALESCE(SUM(amount_paise), 0) AS total_paise,"
                 " SUM(CASE WHEN status = 'settled' THEN 1 ELSE 0 END) AS settled,"
                 " SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending"
-                " FROM commitments WHERE settle_date = ?"
+                f" FROM commitments WHERE settle_date = ?{agent_filter}"
                 " GROUP BY agent_id ORDER BY total_paise DESC",
-                (settle_date,),
+                params,
             ).fetchall()
 
             by_resource = conn.execute(
                 "SELECT resource_id, COUNT(*) AS requests,"
                 " COALESCE(SUM(amount_paise), 0) AS total_paise"
-                " FROM commitments WHERE settle_date = ?"
+                f" FROM commitments WHERE settle_date = ?{agent_filter}"
                 " GROUP BY resource_id ORDER BY total_paise DESC",
-                (settle_date,),
+                params,
             ).fetchall()
 
             batches = conn.execute(
-                "SELECT * FROM batches WHERE settle_date = ? ORDER BY created_at ASC",
-                (settle_date,),
+                f"SELECT * FROM batches WHERE settle_date = ?{agent_filter}"
+                " ORDER BY created_at ASC",
+                params,
             ).fetchall()
 
             rejections = conn.execute(
                 "SELECT COUNT(*) AS n FROM events"
-                " WHERE status = 'rejected' AND substr(ts, 1, 10) = ?",
-                (settle_date,),
+                f" WHERE status = 'rejected' AND substr(ts, 1, 10) = ?{agent_filter}",
+                params,
             ).fetchone()
 
         return {
             "settleDate": settle_date,
+            "agentId": agent_id,
             "requests": totals["requests"],
             "totalPaise": totals["total_paise"],
             "rejectedPayments": rejections["n"],
@@ -520,3 +533,90 @@ class Ledger:
             "byResource": [dict(r) for r in by_resource],
             "batches": [dict(r) for r in batches],
         }
+
+    def commitment_amounts(
+        self, *, agent_id: str | None = None, settle_date: str | None = None
+    ) -> list[int]:
+        """All commitment amounts for a day, regardless of status.
+
+        Feeds `estimate_settlement_cost` for a *read-only* economics view.
+        `/settle-batch` computes the same comparison but only ever sees
+        commitments still `pending` — so a read built the same way would go
+        blank the instant a batch clears, which is a strange way for a
+        dashboard card to behave. This counts the whole day's traffic, settled
+        or not.
+
+        Args:
+            agent_id: Narrow to one agent. Omit for every agent that day.
+            settle_date: Day to inspect. Defaults to today UTC.
+
+        Returns:
+            One entry per commitment, in paise.
+        """
+        settle_date = settle_date or today_utc()
+        query = "SELECT amount_paise FROM commitments WHERE settle_date = ?"
+        params: list[Any] = [settle_date]
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+
+        with self._connect() as conn:
+            return [int(r["amount_paise"]) for r in conn.execute(query, params).fetchall()]
+
+    def list_events(
+        self,
+        *,
+        agent_id: str | None = None,
+        limit: int = 50,
+        since_id: int | None = None,
+    ) -> list[dict]:
+        """Recent audit-log rows, newest first — the live feed for the console.
+
+        `detail` is stored as a JSON string (see `log_event`); parsed back into
+        an object here so a caller gets a normal value rather than a string to
+        parse itself.
+
+        Args:
+            agent_id: Narrow to one agent's events.
+            limit: Row cap, clamped to [1, 200] regardless of what is asked for
+                — this is a public-facing read in the console's case, and
+                nothing should be able to ask for the whole table in one call.
+            since_id: Only rows with `id` greater than this. Lets a poller ask
+                for "what's new" instead of re-fetching everything.
+
+        Returns:
+            Rows as camelCase dicts, `detail` already parsed.
+        """
+        query = (
+            "SELECT id, ts, event, agent_id, resource_id, amount_paise, status, detail"
+            " FROM events"
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if agent_id:
+            clauses.append("agent_id = ?")
+            params.append(agent_id)
+        if since_id is not None:
+            clauses.append("id > ?")
+            params.append(since_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "ts": row["ts"],
+                "event": row["event"],
+                "agentId": row["agent_id"],
+                "resourceId": row["resource_id"],
+                "amountPaise": row["amount_paise"],
+                "status": row["status"],
+                "detail": json.loads(row["detail"]) if row["detail"] else {},
+            }
+            for row in rows
+        ]

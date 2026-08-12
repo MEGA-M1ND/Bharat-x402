@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bharat x402 — live console</title>
+<meta
+  name="description"
+  content="Watch an AI agent pay an Indian publisher in rupees over the x402 protocol, settled through Razorpay."
+/>
+<link
+  rel="icon"
+  href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234F46E5'/%3E%3Ctext x='16' y='23' font-size='19' font-family='Georgia,serif' fill='white' text-anchor='middle'%3E%E2%82%B9%3C/text%3E%3C/svg%3E"
+/>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="topbar__brand">
+      <span class="topbar__mark" aria-hidden="true">₹</span>
+      <div>
+        <div class="topbar__title">Bharat x402</div>
+        <div class="topbar__subtitle">
+          INR settlement facilitator for Cloudflare's x402 agent-payment protocol
+        </div>
+      </div>
+    </div>
+    <div class="topbar__meta">
+      <span class="chip" id="chip-network">connecting…</span>
+      <span class="chip" id="chip-mode">…</span>
+      <span class="chip" id="chip-settlement">…</span>
+      <a
+        class="topbar__link"
+        href="https://github.com/MEGA-M1ND/Bharat-x402"
+        target="_blank"
+        rel="noopener"
+        >Source ↗</a
+      >
+    </div>
+  </header>
+
+  <div id="banner-offline" class="banner banner--warn" hidden>
+    Waking the facilitator up — first request on a cold service can take a few seconds.
+  </div>
+
+  <main class="layout">
+
+    <!-- ============ LEFT: agent console ============ -->
+    <section class="panel" aria-label="AI agent console">
+      <div class="panel__head">
+        <h2>Pay as an AI agent</h2>
+        <p class="panel__sub">
+          Runs the real x402 negotiation against the live facilitator — every step below is
+          genuine wire traffic, not a script pretending to be one.
+        </p>
+      </div>
+
+      <div class="identity-card">
+        <div class="identity-card__row">
+          <span class="identity-card__label">You are</span>
+          <code class="identity-card__value" id="my-agent-id">agent-…</code>
+        </div>
+        <p class="identity-card__note">
+          One identity per browser, chosen once and kept in <code>localStorage</code> — so your
+          dashboard on the right always shows your own traffic, not everyone's mixed together.
+        </p>
+      </div>
+
+      <div class="field">
+        <span class="field__label">Resource to fetch</span>
+        <select id="resource-select" class="select" aria-label="Resource to fetch"></select>
+        <p class="field__hint" id="resource-hint"></p>
+      </div>
+
+      <div class="button-row">
+        <button id="btn-fetch" class="btn btn--primary" type="button">Fetch as AI agent</button>
+        <button id="btn-forge" class="btn btn--ghost" type="button">Try to forge a payment</button>
+      </div>
+      <div class="button-row">
+        <button id="btn-burst" class="btn btn--ghost btn--full" type="button">
+          Fetch the ₹0.50 API call ×20 — watch the economics card fill in
+        </button>
+      </div>
+
+      <ol class="steps" id="steps" aria-live="polite"></ol>
+
+      <div class="result" id="result" hidden></div>
+    </section>
+
+    <!-- ============ RIGHT: publisher dashboard ============ -->
+    <section class="panel" aria-label="Publisher dashboard">
+      <div class="panel__head panel__head--row">
+        <div>
+          <h2>Publisher dashboard</h2>
+          <p class="panel__sub">Bharat News Network — revenue from AI crawler traffic.</p>
+        </div>
+        <div class="scope-toggle" role="group" aria-label="Dashboard scope">
+          <button class="scope-toggle__btn is-active" data-scope="mine" type="button">
+            This session
+          </button>
+          <button class="scope-toggle__btn" data-scope="all" type="button">
+            All visitors today
+          </button>
+        </div>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat-tile">
+          <div class="stat-tile__value" id="stat-revenue">₹0.00</div>
+          <div class="stat-tile__label">earned</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-tile__value" id="stat-requests">0</div>
+          <div class="stat-tile__label">paid requests</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-tile__value" id="stat-agents">0</div>
+          <div class="stat-tile__label">agents</div>
+        </div>
+      </div>
+
+      <div class="card" id="card-activity">
+        <div class="card__head">
+          <h3 id="activity-title">Recent activity</h3>
+        </div>
+        <div id="activity-body">
+          <p class="muted">Nothing yet — fetch something on the left.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card__head card__head--row">
+          <h3>Settlement</h3>
+          <button id="btn-settle" class="btn btn--small" type="button">Run settlement</button>
+        </div>
+        <div id="settlement-status" class="muted">Nothing settled yet.</div>
+        <div id="links-body"></div>
+      </div>
+
+      <div class="card card--economics">
+        <div class="card__head">
+          <h3>Why batching</h3>
+          <p class="card__sub">The argument this whole project is built on — for your traffic.</p>
+        </div>
+        <div id="economics-body">
+          <p class="muted">Fetch the ₹0.50 API call a few times to see this fill in.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p>
+      Test-mode demo — no real money moves.
+      <a href="https://github.com/MEGA-M1ND/Bharat-x402" target="_blank" rel="noopener"
+        >Full source, architecture notes, and README on GitHub</a
+      >.
+    </p>
+  </footer>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

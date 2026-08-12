@@ -18,11 +18,13 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from conftest import TEST_SECRET
+from demo_trace import _build_agent_id
 from ledger import Ledger
 from payment_verifier import (
     OfferPolicy,
@@ -865,3 +867,259 @@ class TestIntegration:
             "/premium/market-report", "/free/market-report-preview"
         )
         assert httpx.get(free_url, timeout=15).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 6. Multi-visitor isolation (the console's agentId scoping)
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerAgentScoping:
+    """Unit-level: the ledger reads that keep one visitor from seeing another's."""
+
+    def _commit(self, ledger, agent_id: str, amount: int, resource_id: str = RESOURCE_ID) -> None:
+        offer = build_offer(
+            agent_id=agent_id, resource_id=resource_id, amount_paise=amount,
+            pay_to=PAY_TO, policy=OfferPolicy(),
+        )
+        ledger.insert_offer(offer, sign(offer, TEST_SECRET))
+        ledger.create_commitment(
+            commitment_id=f"cmt_{offer['offerId'][4:]}", offer_id=offer["offerId"],
+            agent_id=agent_id, resource_id=resource_id, amount_paise=amount,
+            asset="INR", mode="deferred",
+        )
+
+    def test_daily_summary_scopes_to_one_agent(self, ledger):
+        self._commit(ledger, "agent-a", 500)
+        self._commit(ledger, "agent-a", 500)
+        self._commit(ledger, "agent-b", 500)
+
+        scoped = ledger.daily_summary(agent_id="agent-a")
+        assert scoped["requests"] == 2
+        assert scoped["totalPaise"] == 1000
+        assert {a["agent_id"] for a in scoped["byAgent"]} == {"agent-a"}
+
+        unscoped = ledger.daily_summary()
+        assert unscoped["requests"] == 3
+
+    def test_commitment_amounts_scopes_to_one_agent(self, ledger):
+        self._commit(ledger, "agent-a", 50)
+        self._commit(ledger, "agent-a", 50)
+        self._commit(ledger, "agent-b", 500)
+
+        assert ledger.commitment_amounts(agent_id="agent-a") == [50, 50]
+        assert sorted(ledger.commitment_amounts()) == [50, 50, 500]
+
+    def test_list_events_scopes_and_orders_newest_first(self, ledger):
+        ledger.log_event("probe", agent_id="agent-a", status="ok")
+        ledger.log_event("probe", agent_id="agent-b", status="ok")
+        ledger.log_event("probe", agent_id="agent-a", status="ok")
+
+        events = ledger.list_events(agent_id="agent-a")
+        assert len(events) == 2
+        assert all(e["agentId"] == "agent-a" for e in events)
+        assert events[0]["id"] > events[1]["id"]  # newest first
+
+    def test_list_events_since_id_returns_only_newer_rows(self, ledger):
+        ledger.log_event("probe", agent_id="agent-a", status="ok")
+        checkpoint = ledger.list_events(agent_id="agent-a")[0]["id"]
+        ledger.log_event("probe", agent_id="agent-a", status="ok")
+
+        newer = ledger.list_events(agent_id="agent-a", since_id=checkpoint)
+        assert len(newer) == 1
+        assert newer[0]["id"] > checkpoint
+
+    def test_list_events_limit_is_clamped(self, ledger):
+        for _ in range(5):
+            ledger.log_event("probe", agent_id="agent-a", status="ok")
+        assert len(ledger.list_events(agent_id="agent-a", limit=1000)) <= 200
+        assert len(ledger.list_events(agent_id="agent-a", limit=0)) == 1
+
+    def test_list_events_detail_round_trips_as_json(self, ledger):
+        ledger.log_event("probe", agent_id="agent-a", status="ok", offerId="off_x", note="hi")
+        detail = ledger.list_events(agent_id="agent-a")[0]["detail"]
+        assert detail == {"offerId": "off_x", "note": "hi"}
+
+
+class TestGlobalSettleGuard:
+    """A public, multi-visitor deployment must not let one visitor's settle
+    button sweep every other visitor's pending commitments."""
+
+    def _reload_with_global_settle(self, monkeypatch, ledger_path, allowed: bool):
+        import importlib
+
+        monkeypatch.setenv("LEDGER_DB_PATH", str(ledger_path))
+        monkeypatch.setenv("MOCK_RAZORPAY", "true")
+        monkeypatch.setenv("RAZORPAY_KEY_ID", "")
+        monkeypatch.setenv("RAZORPAY_KEY_SECRET", "")
+        monkeypatch.setenv("FACILITATOR_HMAC_SECRET", TEST_SECRET)
+        monkeypatch.setenv("SETTLEMENT_MODE", "deferred")
+        monkeypatch.setenv("ALLOW_GLOBAL_SETTLE", "true" if allowed else "false")
+
+        import main
+
+        importlib.reload(main)
+        return main
+
+    def test_bare_settle_batch_rejected_when_disabled(self, ledger_path, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        main = self._reload_with_global_settle(monkeypatch, ledger_path, allowed=False)
+        with TestClient(main.app) as client:
+            response = client.post("/settle-batch", json={})
+            assert response.status_code == 400
+            assert response.json()["error"] == "agent_id_required"
+
+    def test_scoped_settle_batch_still_works_when_global_disabled(self, ledger_path, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        main = self._reload_with_global_settle(monkeypatch, ledger_path, allowed=False)
+        with TestClient(main.app) as client:
+            envelope = payment_envelope(
+                quote(client, agent_id="agent-scoped"), agent_id="agent-scoped"
+            )
+            client.post("/settle", json=envelope)
+
+            response = client.post("/settle-batch", json={"agentId": "agent-scoped"})
+            assert response.status_code == 200
+            assert response.json()["batchCount"] == 1
+
+    def test_bare_settle_batch_allowed_by_default(self, ledger_path, monkeypatch):
+        """Default stays permissive — nothing about local dev or the scheduler changes."""
+        from fastapi.testclient import TestClient
+
+        main = self._reload_with_global_settle(monkeypatch, ledger_path, allowed=True)
+        with TestClient(main.app) as client:
+            envelope = payment_envelope(quote(client, agent_id="agent-a"), agent_id="agent-a")
+            client.post("/settle", json=envelope)
+
+            response = client.post("/settle-batch", json={})
+            assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 7. The console's server-side agent runner and its read endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestDemoApi:
+    """Requires ENABLE_DEMO_API=1 on the running facilitator (CI sets it).
+
+    See conftest.live_services — skips locally when nothing is up,
+    REQUIRE_INTEGRATION=1 turns that skip into a failure in CI.
+    """
+
+    def test_demo_run_completes_a_real_negotiation(self, live_services):
+        response = httpx.post(
+            f"{live_services['facilitator']}/demo/run",
+            json={
+                "sessionId": "pytest-session",
+                "agentLabel": "test-bot",
+                "resource": "market-report",
+            },
+            timeout=30,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+
+        assert body["ok"] is True
+        assert body["agentId"] == "agent-test-bot-pytestsessio"
+        assert body["amountPaise"] == 500
+        assert [s["n"] for s in body["steps"]] == [1, 2, 3, 4, 5]
+        assert all(s["status"] == "ok" for s in body["steps"])
+        assert body["receipt"]["success"] is True
+        assert body["receipt"]["transaction"].startswith("cmt_")
+        assert "findings" in body["content"]
+
+    def test_demo_run_tamper_flag_produces_a_genuine_rejection(self, live_services):
+        response = httpx.post(
+            f"{live_services['facilitator']}/demo/run",
+            json={
+                "sessionId": "pytest-tamper",
+                "agentLabel": "forger",
+                "resource": "market-report",
+                "tamper": True,
+            },
+            timeout=30,
+        )
+        assert response.status_code == 200
+        body = response.json()
+
+        assert body["ok"] is False
+        assert body["error"] == "invalid_signature"
+        step_4 = next(s for s in body["steps"] if s["n"] == 4)
+        assert step_4["status"] == "failed"
+        assert body["content"] is None
+
+    def test_demo_run_never_leaks_the_shared_secret(self, live_services):
+        """The one property that makes 'signing happens server-side' a fact
+        rather than a slogan: the secret must not be anywhere in the response."""
+        secret_candidates = ["dev-only-shared-secret-change-me"]
+
+        response = httpx.post(
+            f"{live_services['facilitator']}/demo/run",
+            json={"sessionId": "pytest-leak-check", "agentLabel": "auditor"},
+            timeout=30,
+        )
+        raw = response.text
+        for secret in secret_candidates:
+            assert secret not in raw
+
+    def test_demo_run_rejects_a_malformed_session_id(self, live_services):
+        response = httpx.post(
+            f"{live_services['facilitator']}/demo/run",
+            json={"sessionId": "ab"},  # below min_length=4
+            timeout=15,
+        )
+        assert response.status_code == 422
+
+    def test_economics_reflects_micro_priced_traffic(self, live_services):
+        # A unique session per run: the ledger persists across test runs (it is
+        # the same file a human might be poking at locally), and an assertion
+        # on an *exact* count has to not collide with whatever a previous run
+        # already committed under a fixed session id. Same reasoning as the
+        # random RUN suffix in tests/ci_batch_flow.py.
+        session = f"econcheck{secrets.token_hex(4)}"
+        agent_id = _build_agent_id(session, "micro-bot")
+
+        for _ in range(5):
+            httpx.post(
+                f"{live_services['facilitator']}/demo/run",
+                json={"sessionId": session, "agentLabel": "micro-bot", "resource": "api-call"},
+                timeout=30,
+            )
+
+        response = httpx.get(
+            f"{live_services['facilitator']}/economics", params={"agentId": agent_id}, timeout=15
+        )
+        assert response.status_code == 200
+        econ = response.json()["economics"]
+        assert econ is not None
+        assert econ["commitmentCount"] == 5
+        assert econ["belowGatewayMinimum"] == 5
+        assert econ["revenueUnreachablePerRequestPaise"] == econ["totalPaise"]
+
+    def test_ledger_summary_and_events_scope_to_one_agent(self, live_services):
+        session = f"scopecheck{secrets.token_hex(4)}"
+        agent_id = _build_agent_id(session, "scoped-bot")
+        httpx.post(
+            f"{live_services['facilitator']}/demo/run",
+            json={"sessionId": session, "agentLabel": "scoped-bot", "resource": "market-report"},
+            timeout=30,
+        )
+
+        summary = httpx.get(
+            f"{live_services['facilitator']}/ledger/summary",
+            params={"agentId": agent_id},
+            timeout=15,
+        ).json()
+        assert summary["requests"] >= 1
+        assert all(a["agent_id"] == agent_id for a in summary["byAgent"])
+
+        events = httpx.get(
+            f"{live_services['facilitator']}/ledger/events",
+            params={"agentId": agent_id, "limit": 20},
+            timeout=15,
+        ).json()
+        assert len(events["events"]) >= 1
+        assert all(e["agentId"] == agent_id for e in events["events"])

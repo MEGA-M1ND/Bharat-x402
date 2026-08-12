@@ -92,7 +92,12 @@ jobs:
           cp resource-server/.env.example resource-server/.env
           cp demo-agent/.env.example demo-agent/.env
 
+      # ENABLE_DEMO_API turns on the console's server-side agent runner
+      # (facilitator/demo_trace.py), exercised by the integration tests below.
       - name: Start facilitator
+        env:
+          ENABLE_DEMO_API: "1"
+          RESOURCE_URL: "http://localhost:3402"
         run: |
           cd facilitator
           nohup python -m uvicorn main:app --port 8402 > /tmp/facilitator.log 2>&1 &
@@ -143,6 +148,39 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' \
             http://localhost:3402/free/market-report-preview)
           test "$status" = "200"
+
+      # The console is what a reviewer actually sees, so it gets its own
+      # smoke check: the page loads, the two API endpoints it depends on
+      # answer, and the micro-priced route it needs for the economics card
+      # exists at a price under the gateway minimum.
+      - name: Console UI is served and its endpoints answer
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3402/)
+          test "$status" = "200"
+          curl -sf http://localhost:3402/ | grep -qi '<title>Bharat x402'
+
+          curl -sf http://localhost:3402/api/resources | tee /dev/stderr \
+            | grep -q '"key":"api-call"'
+
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3402/premium/api-call)
+          test "$status" = "402"
+
+      # POST /demo/run is the console's server-side agent runner — this is
+      # what a click of "Fetch as AI agent" actually calls.
+      - name: Console's demo API completes a negotiation
+        run: |
+          curl -sf -X POST http://localhost:8402/demo/run \
+            -H 'Content-Type: application/json' \
+            -d '{"sessionId":"ci-smoke-session","agentLabel":"ci-bot","resource":"market-report"}' \
+            -o /tmp/demo_run.json
+          python -c '
+          import json
+          d = json.load(open("/tmp/demo_run.json", encoding="utf-8"))
+          assert d["ok"] is True, d
+          assert d["receipt"]["transaction"].startswith("cmt_"), d
+          assert "dev-only-shared-secret" not in json.dumps(d)
+          print("demo/run OK:", d["agentId"], d["receipt"]["transaction"])
+          '
 
       # The full suite against live services. REQUIRE_INTEGRATION turns an
       # unreachable service into a failure instead of a skip — a suite that
