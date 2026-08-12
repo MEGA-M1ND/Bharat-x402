@@ -225,23 +225,45 @@ const PREMIUM_MARKET_REPORT = {
 };
 
 /**
- * Routes the payment middleware guards, keyed by path.
- *
- * The `accepts` array is the menu of ways to pay. We advertise exactly one —
- * INR through Razorpay. A production publisher could list USDC-on-Base
- * alongside it and let the agent choose; that is the whole point of `accepts`
- * being a list.
+ * The micro-priced resource. Deliberately shaped like a single API lookup
+ * rather than a document: the market report is the kind of thing an agent
+ * fetches once, this is the kind of thing it calls constantly. That
+ * difference in access pattern is *why* the price sits under Razorpay's ₹1
+ * floor, and why deferred settlement exists at all — see docs/architecture.md.
+ */
+const API_CALL_SAMPLE = {
+  resourceId: "fx-rate-lookup",
+  title: "USD/INR spot rate",
+  publisher: "Bharat News Network",
+  pair: "USD/INR",
+  rate: 83.12,
+  note:
+    "A single API lookup — the shape of traffic that makes sub-rupee pricing " +
+    "necessary, and per-request settlement of it impossible.",
+};
+
+/**
+ * Builds one route's config: the `accepts` entry plus the 402 body shown to
+ * an unpaid caller. Factored out so the market report and the micro API-call
+ * resource share the exact same shaping logic rather than two hand-maintained
+ * copies of it.
  *
  * @param {object} options
+ * @param {string} options.path Route path, e.g. "/premium/market-report".
+ * @param {string} options.resourceId Id used in the offer and in ledger grouping.
+ * @param {string} options.title Shown in `serviceName`/`description`/preview.
+ * @param {string} options.summary One-line preview text for the 402 body.
+ * @param {string} options.price Price in rupees for this specific resource.
  * @param {string} options.payTo Publisher's settlement account.
- * @param {string} options.price Route price in rupees.
- * @returns {object} RoutesConfig for @x402/express.
+ * @param {string} options.facilitatorUrl Where to get quoted.
+ * @param {string[]} options.tags Route tags.
+ * @returns {{[key: string]: object}} One entry for the RoutesConfig.
  */
-function buildRoutes({ payTo, price, facilitatorUrl }) {
+function buildResourceRoute({ path, resourceId, title, summary, price, payTo, facilitatorUrl, tags }) {
   const amountPaise = rupeesToPaise(price);
 
   return {
-    "GET /premium/market-report": {
+    [`GET ${path}`]: {
       accepts: [
         {
           scheme: SCHEME,
@@ -252,10 +274,10 @@ function buildRoutes({ payTo, price, facilitatorUrl }) {
           maxTimeoutSeconds: 300,
         },
       ],
-      description: PREMIUM_MARKET_REPORT.title,
+      description: title,
       mimeType: "application/json",
       serviceName: PREMIUM_MARKET_REPORT.publisher,
-      tags: ["market-data", "india", "fintech"],
+      tags,
 
       /**
        * Body returned alongside the 402.
@@ -284,7 +306,7 @@ function buildRoutes({ payTo, price, facilitatorUrl }) {
 
           // Human-readable mirror of the PAYMENT-REQUIRED header.
           offer: {
-            resourceId: PREMIUM_MARKET_REPORT.resourceId,
+            resourceId,
             scheme: SCHEME,
             network: NETWORK,
             asset: ASSET,
@@ -298,9 +320,9 @@ function buildRoutes({ payTo, price, facilitatorUrl }) {
           },
 
           preview: {
-            title: PREMIUM_MARKET_REPORT.title,
+            title,
             publisher: PREMIUM_MARKET_REPORT.publisher,
-            summary: PREMIUM_MARKET_REPORT.summary.slice(0, 120) + "…",
+            summary,
           },
 
           hint: "The authoritative offer is the base64 PAYMENT-REQUIRED response header.",
@@ -311,6 +333,53 @@ function buildRoutes({ payTo, price, facilitatorUrl }) {
   };
 }
 
+/**
+ * Routes the payment middleware guards, keyed by path.
+ *
+ * Two resources at two price points, on purpose: ₹5 clears Razorpay's ₹1
+ * gateway minimum on its own, so it alone would never demonstrate the reason
+ * deferred settlement exists. ₹0.50 does not clear it — that gap is the whole
+ * argument this project makes, and it needs a real route to show it against.
+ *
+ * The `accepts` array on each route is the menu of ways to pay for *that*
+ * resource. We advertise exactly one per resource — INR through Razorpay. A
+ * production publisher could list USDC-on-Base alongside it and let the agent
+ * choose; that is the whole point of `accepts` being a list.
+ *
+ * @param {object} options
+ * @param {string} options.payTo Publisher's settlement account.
+ * @param {string} options.price Market-report price in rupees.
+ * @param {string} options.priceMicro API-call price in rupees.
+ * @param {string} options.facilitatorUrl Where to get quoted.
+ * @returns {object} RoutesConfig for @x402/express.
+ */
+function buildRoutes({ payTo, price, priceMicro, facilitatorUrl }) {
+  return {
+    ...buildResourceRoute({
+      path: "/premium/market-report",
+      resourceId: PREMIUM_MARKET_REPORT.resourceId,
+      title: PREMIUM_MARKET_REPORT.title,
+      summary: PREMIUM_MARKET_REPORT.summary.slice(0, 120) + "…",
+      price,
+      payTo,
+      facilitatorUrl,
+      tags: ["market-data", "india", "fintech"],
+    }),
+    ...(priceMicro
+      ? buildResourceRoute({
+          path: "/premium/api-call",
+          resourceId: API_CALL_SAMPLE.resourceId,
+          title: API_CALL_SAMPLE.title,
+          summary: API_CALL_SAMPLE.note,
+          price: priceMicro,
+          payTo,
+          facilitatorUrl,
+          tags: ["api", "micro-payment", "india"],
+        })
+      : {}),
+  };
+}
+
 module.exports = {
   SCHEME,
   NETWORK,
@@ -318,6 +387,7 @@ module.exports = {
   INR_DECIMALS,
   RazorpayInrScheme,
   PREMIUM_MARKET_REPORT,
+  API_CALL_SAMPLE,
   buildRoutes,
   rupeesToPaise,
   paiseToRupeeString,

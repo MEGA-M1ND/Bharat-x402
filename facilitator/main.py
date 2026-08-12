@@ -45,6 +45,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from ledger import Ledger, today_utc
 from payment_verifier import (
@@ -103,6 +104,27 @@ OFFER_POLICY = OfferPolicy(
 # from the payTo in the payment requirements; the demo has one publisher.
 FACILITATOR_ACCOUNT = os.getenv("FACILITATOR_ACCOUNT", "acc_BharatX402TestFacilitator")
 
+# Whether a bare POST /settle-batch (no agentId) is allowed to sweep every
+# agent that owes money. True by default so nothing about local dev,
+# scheduler.py, or the existing test suite changes. A public multi-visitor
+# deployment must set this to false — otherwise one visitor's settle button
+# charges every other visitor's pending commitments into their batch.
+ALLOW_GLOBAL_SETTLE = os.getenv("ALLOW_GLOBAL_SETTLE", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# The console's server-side agent runner (facilitator/demo_trace.py). Off by
+# default: it is a public write endpoint that creates ledger rows on request,
+# which is fine for a demo deployment and not something to expose silently.
+ENABLE_DEMO_API = os.getenv("ENABLE_DEMO_API", "false").strip().lower() in ("1", "true", "yes")
+
+# Where the publisher's resource server lives — only used by the demo API,
+# to make the real cross-service HTTP calls a browser client can't safely
+# make itself (see demo_trace.py for why).
+RESOURCE_URL = os.getenv("RESOURCE_URL", "http://localhost:3402")
+
 ledger = Ledger(os.getenv("LEDGER_DB_PATH") or str(SERVICE_DIR / "data" / "ledger.db"))
 gateway = RazorpayGateway(
     key_id=os.getenv("RAZORPAY_KEY_ID"),
@@ -115,6 +137,32 @@ app = FastAPI(
     description="INR settlement facilitator for the x402 agent payment protocol.",
     version="0.3.0",
 )
+
+# CORS. Same-origin once this and the resource server share a deployment, but
+# needed for local dev (console on :3402, facilitator on :8402) and for any
+# other client poking the API directly. `expose_headers` is the part that is
+# easy to miss and silently breaks a browser client — without it, reading
+# these headers from a fetch() Response returns null even on a 200, because
+# the fetch spec hides non-simple response headers from JS unless the server
+# explicitly exposes them.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"],
+)
+
+if ENABLE_DEMO_API:
+    import demo_trace
+
+    demo_trace.configure(
+        ledger=ledger,
+        hmac_secret=HMAC_SECRET,
+        offer_policy=OFFER_POLICY,
+        resource_url=RESOURCE_URL,
+    )
+    app.include_router(demo_trace.router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -701,6 +749,19 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
     Returns:
         Per-agent batch results plus the settlement cost comparison.
     """
+    if not request.agentId and not ALLOW_GLOBAL_SETTLE:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "agent_id_required",
+                "message": (
+                    "This facilitator requires an agentId for /settle-batch. Settling "
+                    "without one would sweep every visitor's pending commitments into "
+                    "a single run."
+                ),
+            },
+        )
+
     settle_date = request.settleDate or today_utc()
     agents = (
         [request.agentId]
@@ -878,9 +939,46 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
 
 
 @app.get("/ledger/summary")
-def ledger_summary(settleDate: str | None = None) -> dict:
-    """One day's activity, for the reporting script and for eyeballing a demo."""
-    return ledger.daily_summary(settleDate)
+def ledger_summary(settleDate: str | None = None, agentId: str | None = None) -> dict:
+    """One day's activity, for the reporting script and for eyeballing a demo.
+
+    `agentId` narrows to one agent's traffic — what the console's dashboard
+    uses so one visitor's session does not show, or via `/settle-batch`,
+    settle, everyone else's pending commitments too.
+    """
+    return ledger.daily_summary(settleDate, agent_id=agentId)
+
+
+@app.get("/economics")
+def economics(settleDate: str | None = None, agentId: str | None = None) -> dict:
+    """The batching-versus-per-request comparison, as a read.
+
+    `/settle-batch` computes the same figures but only ever sees commitments
+    still `pending` — so a card built the same way would go blank the instant
+    a batch clears. This looks at every commitment for the day regardless of
+    status, so the number stays put after settling.
+    """
+    settle_date = settleDate or today_utc()
+    amounts = ledger.commitment_amounts(agent_id=agentId, settle_date=settle_date)
+    return {
+        "settleDate": settle_date,
+        "agentId": agentId,
+        "economics": estimate_settlement_cost(amounts, fee_model) if amounts else None,
+    }
+
+
+@app.get("/ledger/events")
+def ledger_events(
+    agentId: str | None = None, limit: int = 50, sinceId: int | None = None
+) -> dict:
+    """The audit trail as a live feed — every event `log_event` has recorded.
+
+    `sinceId` lets a poller ask for what's new since the last call rather
+    than re-fetching the whole window; pass back the response's own
+    `nextSinceId` on the following call.
+    """
+    events = ledger.list_events(agent_id=agentId, limit=limit, since_id=sinceId)
+    return {"events": events, "nextSinceId": events[0]["id"] if events else sinceId}
 
 
 @app.get("/health")
@@ -903,7 +1001,8 @@ def root() -> dict:
         "razorpayMode": gateway.mode,
         "x402Endpoints": ["/supported", "/verify", "/settle"],
         "inrEndpoints": ["/offer", "/settle-batch"],
-        "operational": ["/health", "/ledger/summary"],
+        "operational": ["/health", "/ledger/summary", "/economics", "/ledger/events"],
+        "demoApi": ["/demo/run"] if ENABLE_DEMO_API else [],
     }
 
 

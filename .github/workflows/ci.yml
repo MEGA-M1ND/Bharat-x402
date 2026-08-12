@@ -92,7 +92,12 @@ jobs:
           cp resource-server/.env.example resource-server/.env
           cp demo-agent/.env.example demo-agent/.env
 
+      # ENABLE_DEMO_API turns on the console's server-side agent runner
+      # (facilitator/demo_trace.py), exercised by the integration tests below.
       - name: Start facilitator
+        env:
+          ENABLE_DEMO_API: "1"
+          RESOURCE_URL: "http://localhost:3402"
         run: |
           cd facilitator
           nohup python -m uvicorn main:app --port 8402 > /tmp/facilitator.log 2>&1 &

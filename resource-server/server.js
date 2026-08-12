@@ -35,6 +35,7 @@ const {
   NETWORK,
   RazorpayInrScheme,
   PREMIUM_MARKET_REPORT,
+  API_CALL_SAMPLE,
   buildRoutes,
 } = require("./x402-config");
 
@@ -43,8 +44,47 @@ const FACILITATOR_URL = (process.env.FACILITATOR_URL || "http://localhost:8402")
 const PAY_TO = process.env.PAY_TO || "acc_BharatNewsNetwork";
 const PRICE = process.env.RESOURCE_PRICE || "₹5.00";
 
+// A second, sub-rupee resource. This is the price point that makes the whole
+// project's argument: ₹5 clears Razorpay's ₹1 minimum on its own, so without
+// this route the console's economics card would always show a zero — nothing
+// would ever be "uncollectable per-request" to point at.
+const PRICE_MICRO = process.env.RESOURCE_PRICE_MICRO || "₹0.50";
+
 const app = express();
 app.use(express.json());
+
+/**
+ * CORS.
+ *
+ * On Vercel the console and both APIs share one origin, which makes this
+ * moot in production — but it is what lets the console run against a
+ * separately-started resource server in local dev, and lets anyone poke the
+ * API from a page of their own. `*` is fine here: nothing behind this gate
+ * is cookie-authenticated, and the payment proof itself is the credential.
+ *
+ * `Access-Control-Expose-Headers` is the part that is easy to miss and silently
+ * breaks a browser client: without it, `response.headers.get("payment-required")`
+ * returns `null` even on a genuine 402, because the fetch spec hides
+ * non-simple response headers from JS unless the server explicitly exposes
+ * them. curl and httpx never had this problem, which is why it went unnoticed
+ * until a browser was actually in the loop.
+ *
+ * The OPTIONS short-circuit has to sit before the payment gate — a preflight
+ * to a paid route would otherwise be evaluated as a request for payment.
+ */
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-PAYMENT, PAYMENT-SIGNATURE");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE"
+  );
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 /**
  * Header compatibility shim.
@@ -83,6 +123,15 @@ app.use((req, res, next) => {
 
   next();
 });
+
+/**
+ * The console UI. Plain static files, no build step — matches the rest of
+ * this repo's zero-tooling ethos. Registered before the payment gate so the
+ * dashboard stays reachable even when settlement is down; it reads the
+ * publisher's own revenue, which is exactly the thing you want visible when
+ * something is wrong.
+ */
+app.use(express.static(require("path").join(__dirname, "public")));
 
 /**
  * Minimal structured logging. Every service in this project emits one JSON
@@ -149,40 +198,50 @@ resourceServer.onSettleFailure(async ({ requirements, error }) => {
   log("payment_settle_failed", { amount: requirements.amount, reason: error.message });
 });
 
-const routes = buildRoutes({ payTo: PAY_TO, price: PRICE, facilitatorUrl: FACILITATOR_URL });
+const routes = buildRoutes({
+  payTo: PAY_TO,
+  price: PRICE,
+  priceMicro: PRICE_MICRO,
+  facilitatorUrl: FACILITATOR_URL,
+});
 
 /**
- * The payment gate, created once the facilitator is known to be answering.
+ * The payment gate, built lazily on the first request rather than at module
+ * load or inside `start()`.
  *
- * Why it is deferred rather than built here: `paymentMiddleware()` fires its
- * own `GET /supported` at *construction* time and caches the resulting
- * promise. Build it before the facilitator is up and that cached promise is
- * already rejected, so the first paid request fails with a 500 and only the
- * second one recovers. Under `docker compose up`, where both services start
- * together, that is the very first request a user makes.
+ * Neither of those alternatives is right, and both were tried here at
+ * different points:
+ *
+ *   - Built at module load: `paymentMiddleware()` fires its own
+ *     `GET /supported` at *construction* time. If the facilitator is not up
+ *     yet, that fetch fails and the very first request pays for it — a 502
+ *     before the handler ever runs.
+ *   - Built inside `start()`: works for `node server.js`, but a serverless
+ *     platform imports this module and calls the exported `app` directly.
+ *     There is no `start()` call, so the gate would never be built at all,
+ *     and every request would need a guard against that — which is exactly
+ *     the 503 branch this file used to have.
+ *
+ * Building on first request sidesteps both: by the time anyone hits this
+ * middleware, the module has finished loading and `routes`/`resourceServer`
+ * exist, in every environment. The assignment is synchronous, so two
+ * concurrent first requests cannot race and build the gate twice.
+ *
+ * Fail-closed still holds, and it is not this file's job to provide it — the
+ * middleware provides it. If `/supported` is unreachable, `requiresPayment()`
+ * is still true and `initialize()` throws before the handler runs, so paid
+ * content is never served on an unverified request. And per the library's own
+ * source (`@x402/express` `initializeHttpServer`), a failed fetch resets its
+ * cached promise to `null`, so the *next* request retries rather than staying
+ * poisoned — only the unlucky first request ever pays the cold-start cost.
  */
 let paymentGate = null;
 
-/**
- * Permanent guard, registered now so it always sits in front of the protected
- * handler regardless of when the gate itself becomes available.
- *
- * Registration order is what enforces the paywall in Express: a route
- * registered before its guard is a route served for free. So the guard goes in
- * at module load and delegates to the gate once there is one — and refuses the
- * request outright while there is not.
- */
 app.use((req, res, next) => {
-  if (paymentGate) {
-    return paymentGate(req, res, next);
+  if (!paymentGate) {
+    paymentGate = paymentMiddleware(routes, resourceServer);
   }
-  // Fail closed. Serving paid content because settlement is not ready yet is
-  // the one mistake a paywall cannot make.
-  log("gate_not_ready", { path: req.path });
-  return res.status(503).json({
-    error: "settlement_unavailable",
-    message: "Payment settlement is not ready yet. Try again shortly.",
-  });
+  return paymentGate(req, res, next);
 });
 
 /**
@@ -234,6 +293,21 @@ app.get("/premium/market-report", (req, res) => {
   });
 });
 
+/**
+ * The micro-priced sibling. Content deliberately looks like a single API
+ * lookup rather than a document — that shape, fetched often, is what sub-rupee
+ * agent pricing is actually for.
+ */
+app.get("/premium/api-call", (req, res) => {
+  const payer = req.header("x-payment") ? "paid-agent" : "unknown";
+  log("premium_resource_served", { resourceId: API_CALL_SAMPLE.resourceId, payer });
+
+  res.json({
+    ...API_CALL_SAMPLE,
+    servedAt: new Date().toISOString(),
+  });
+});
+
 /** Free sample, so an agent can decide whether the paid fetch is worth ₹5. */
 app.get("/free/market-report-preview", (_req, res) => {
   res.json({
@@ -249,19 +323,50 @@ app.get("/health", (_req, res) => {
   res.json({ service: "resource-server", status: "ok", facilitator: FACILITATOR_URL });
 });
 
-app.get("/", (_req, res) => {
+/**
+ * Service metadata. Used to live at `GET /`, back when there was no UI to
+ * serve there — moved so `express.static` can own the site root and hand
+ * visitors the console instead of raw JSON.
+ */
+app.get("/api/info", (_req, res) => {
   res.json({
     service: "Bharat x402 resource server",
     description: "Publisher content gated behind x402, priced in INR, settled via Razorpay.",
     scheme: SCHEME,
     network: NETWORK,
-    price: PRICE,
     facilitator: FACILITATOR_URL,
     routes: {
       free: "/free/market-report-preview",
       paid: "/premium/market-report",
       health: "/health",
+      resources: "/api/resources",
     },
+  });
+});
+
+/**
+ * What the console's resource picker fetches at load time, rather than
+ * hardcoding prices into the page — the price lives in one place, this
+ * service's own env config, the same values the 402 itself quotes.
+ */
+app.get("/api/resources", (_req, res) => {
+  res.json({
+    resources: [
+      {
+        key: "market-report",
+        path: "/premium/market-report",
+        price: PRICE,
+        title: PREMIUM_MARKET_REPORT.title,
+        description: "A full report — the kind of thing you fetch once.",
+      },
+      {
+        key: "api-call",
+        path: "/premium/api-call",
+        price: PRICE_MICRO,
+        title: API_CALL_SAMPLE.title,
+        description: "A single lookup — the kind of thing an agent calls constantly.",
+      },
+    ],
   });
 });
 
@@ -275,21 +380,24 @@ app.use((err, _req, res, _next) => {
 });
 
 /**
- * Boots the server once the facilitator is answering.
+ * Boots the server for local dev (`node server.js`).
+ *
+ * This is a courtesy, not a requirement: the payment gate no longer depends
+ * on `start()` running at all (see the gate's own comment above), so a
+ * serverless platform that imports `app` directly and never calls `start()`
+ * is still correctly wired. What this function buys locally is a port that
+ * only opens once the facilitator has actually been reached once, so the
+ * very first request a person makes doesn't pay the cold-start tax the gate
+ * would otherwise absorb silently.
  *
  * @returns {Promise<void>}
  */
 async function start() {
   const ready = await waitForFacilitator();
 
-  // Build the gate only now, so its startup /supported call lands on a
-  // facilitator that is actually listening.
-  paymentGate = paymentMiddleware(routes, resourceServer);
-
   if (!ready) {
     // Start anyway: better to fail the paid route and keep the free routes up
     // than to take the whole publisher offline because settlement is down.
-    // The guard is registered either way, so nothing is served unpaid.
     console.warn(
       `[resource-server] facilitator at ${FACILITATOR_URL} did not respond — ` +
         "paid routes will fail until it does"
@@ -304,9 +412,13 @@ async function start() {
       scheme: SCHEME,
       network: NETWORK,
       price: PRICE,
+      priceMicro: PRICE_MICRO,
       payTo: PAY_TO,
     });
-    console.log(`[resource-server] http://localhost:${PORT} — paid route: /premium/market-report (${PRICE})`);
+    console.log(
+      `[resource-server] http://localhost:${PORT} — console + paid routes ` +
+        `(${PRICE} / ${PRICE_MICRO})`
+    );
   });
 }
 
