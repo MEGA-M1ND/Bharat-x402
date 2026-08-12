@@ -335,7 +335,28 @@ curl -s http://localhost:8402/health
 ```
 
 Batches now create real Payment Links in your test dashboard, and `paymentLinkUrl` is a
-live `rzp.io` link you can open.
+live `rzp.io` link you can open:
+
+```json
+{"event": "settlement_run", "batches": 5, "created": 5, "totalPaise": 3500,
+ "paymentLinks": ["plink_TOk88dBGlGTOeq", "plink_TOk89ZNUFJR7oG", ...]}
+```
+
+If the credentials are wrong, you find out at **startup** rather than at settlement:
+
+```json
+{"event": "razorpay_credentials_invalid", "status": "rejected",
+ "message": "Razorpay rejected these credentials. The key id and secret must come from
+  the same key pair — Razorpay shows a secret only once, when it is generated..."}
+```
+
+The service still starts. `/verify` and `/settle` never touch Razorpay, so payments are
+still accepted and the ledger stays correct; only `/settle-batch` is affected, and those
+commitments wait for the next run.
+
+> **What "verified" covers.** Links are created, fetched back, and reconciled against the
+> ledger. There is **no webhook handling** — a link that is actually *paid* does not update
+> the ledger. Production needs a `payment_link.paid` webhook.
 
 > **A live key will not start.** The facilitator refuses any `rzp_live_` credential and
 > exits with an explanation. This project creates Payment Links in a loop; it has no

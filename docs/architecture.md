@@ -115,6 +115,21 @@ call is not *expensive* to settle individually — it is *impossible*. Sub-rupee
 where agent API pricing wants to sit, so batching is not an optimisation here. It is what
 makes the price point exist at all.
 
+This is verified against Razorpay's live test API rather than taken from documentation.
+Posting the two amounts directly to `POST /v1/payment_links`, bypassing this project's own
+guard:
+
+```
+Rs 0.50 (50 paise)    REJECTED 400 -> "amount: amount should be minimum 1.00 for INR."
+Rs 1.00 (100 paise)   ACCEPTED     -> plink_TOk9oC7MhfFJqp
+```
+
+**1b. The rate limit.** Discovered the same way. Razorpay returns `429 Too many requests`
+when links are created back to back, which a settlement run does — one per paying agent.
+So per-request settlement of agent traffic would not merely be uneconomic; at any real
+volume it would exceed the gateway's request budget outright. `_create_with_retry` backs
+off on 429 and only on 429.
+
 **2. Checkout has a human in it.** A Payment Link is a hosted page somebody opens and
 pays on. That cannot sit in the path of an HTTP request an agent makes ten thousand times
 a day, at any fee. One charge per agent per day is a shape that works; one per request is
@@ -209,7 +224,7 @@ mostly this list.
 | **Ledger** | SQLite, single writer behind a lock | Postgres, with the commitment table partitioned by settlement date |
 | **Batch failure** | Commitments stay pending, retried next run | Dead-letter queue, alerting, partial-batch recovery, reconciliation against Razorpay's own records |
 | **Replay protection** | Single-use offers with expiry | Same, plus a distributed nonce cache so multiple facilitator instances agree |
-| **Razorpay calls** | Exercised in mock mode only | Verified against test keys, then live, with webhook handling for payment status |
+| **Razorpay calls** | Verified against real test-mode keys — links created, fetched back, and reconciled. No webhook handling, so a link that is actually *paid* does not update the ledger | Webhook endpoint for `payment_link.paid`, reconciliation against Razorpay's settlement reports |
 | **Secrets** | `.env` files | A secret manager; the HMAC secret becomes per-agent public keys and stops being a secret at all |
 
 ### Deliberately kept, not simplified

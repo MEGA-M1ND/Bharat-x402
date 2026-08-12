@@ -391,6 +391,51 @@ class TestRazorpayGuards:
         assert gateway.mock is False
         assert gateway.mode == "razorpay_test"
 
+    def test_rate_limits_are_retried(self, monkeypatch):
+        """Razorpay rate-limits, and settlement creates links back to back.
+
+        Found by running against the real test API: a publisher with enough
+        paying agents hits 429 partway through a settlement run.
+        """
+        gateway = RazorpayGateway(key_id="rzp_test_fake", key_secret="fake", mock=False)
+        calls = {"n": 0}
+
+        class FlakyLinks:
+            @staticmethod
+            def create(payload):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise Exception("Too many requests")
+                return {"id": "plink_ok", "short_url": "https://rzp.io/x", "status": "created"}
+
+        monkeypatch.setattr(gateway, "_client", type("C", (), {"payment_link": FlakyLinks})())
+        monkeypatch.setattr("razorpay_client.time.sleep", lambda _: None)
+
+        link = gateway.create_payment_link(
+            amount_paise=500, description="d", reference_id="r", agent_id="a"
+        )
+        assert link["id"] == "plink_ok"
+        assert calls["n"] == 3
+
+    def test_non_rate_limit_errors_are_not_retried(self, monkeypatch):
+        """A rejected amount fails identically every time; retrying just delays the report."""
+        gateway = RazorpayGateway(key_id="rzp_test_fake", key_secret="fake", mock=False)
+        calls = {"n": 0}
+
+        class RejectingLinks:
+            @staticmethod
+            def create(payload):
+                calls["n"] += 1
+                raise Exception("amount: amount should be minimum 1.00 for INR.")
+
+        monkeypatch.setattr(gateway, "_client", type("C", (), {"payment_link": RejectingLinks})())
+
+        with pytest.raises(Exception, match="minimum 1.00"):
+            gateway.create_payment_link(
+                amount_paise=500, description="d", reference_id="r", agent_id="a"
+            )
+        assert calls["n"] == 1
+
     def test_below_minimum_charge_is_refused(self):
         """The constraint the whole project is built around."""
         gateway = RazorpayGateway(key_id="", key_secret="")
