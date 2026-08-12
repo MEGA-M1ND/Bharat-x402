@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -63,7 +64,13 @@ from razorpay_client import (
     format_paise,
 )
 
-load_dotenv()
+# Anchor to this file rather than the working directory. `uvicorn main:app
+# --app-dir facilitator` runs from the repo root, and a facilitator that reads
+# its config — or worse, writes its ledger — somewhere different depending on
+# where you launched it from is a genuinely nasty way to lose a day's revenue.
+SERVICE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(SERVICE_DIR / ".env")
 
 PORT = int(os.getenv("PORT", "8402"))
 
@@ -96,7 +103,7 @@ OFFER_POLICY = OfferPolicy(
 # from the payTo in the payment requirements; the demo has one publisher.
 FACILITATOR_ACCOUNT = os.getenv("FACILITATOR_ACCOUNT", "acc_BharatX402TestFacilitator")
 
-ledger = Ledger(os.getenv("LEDGER_DB_PATH", "./data/ledger.db"))
+ledger = Ledger(os.getenv("LEDGER_DB_PATH") or str(SERVICE_DIR / "data" / "ledger.db"))
 gateway = RazorpayGateway(
     key_id=os.getenv("RAZORPAY_KEY_ID"),
     key_secret=os.getenv("RAZORPAY_KEY_SECRET"),

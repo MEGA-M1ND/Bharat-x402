@@ -1,0 +1,4 @@
+# Tooling for running the test suite and linter. The services themselves need
+# only facilitator/requirements.txt and demo-agent/requirements.txt.
+pytest==9.1.1
+ruff==0.14.5
