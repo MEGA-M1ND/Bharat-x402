@@ -49,6 +49,7 @@ actual proof of this, not this comment.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
@@ -97,10 +98,20 @@ def _split_sql_statements(script: str) -> list[str]:
     """Splits a `;`-separated DDL script into individual statements.
 
     psycopg has no `executescript` — unlike sqlite3, it expects one statement
-    per `execute()` call. A naive split on `;` is fine for this project's DDL:
-    no string literals or stored procedures contain an embedded semicolon.
+    per `execute()` call.
+
+    Comments are stripped first. Found out the hard way, against real
+    Postgres in CI, that this matters: this project's own schema comments
+    are ordinary English, and ordinary English contains semicolons —
+    `-- ... is ever updated or deleted; it is the audit trail ...` split
+    right through that sentence, and Postgres was handed a fragment starting
+    mid-comment with no `--` in front of it, which is a syntax error, not a
+    comment. No string literal or stored procedure in this project's DDL
+    contains an embedded semicolon, so stripping `--`-to-end-of-line before
+    splitting is safe for what this function actually has to parse.
     """
-    return [statement.strip() for statement in script.split(";") if statement.strip()]
+    without_comments = re.sub(r"--[^\n]*", "", script)
+    return [statement.strip() for statement in without_comments.split(";") if statement.strip()]
 
 
 class Conn:
