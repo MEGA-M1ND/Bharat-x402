@@ -12,6 +12,13 @@ Two kinds of test live in this suite:
     quietly stops testing the thing it exists to test is worse than no suite —
     so setting REQUIRE_INTEGRATION=1 turns an unreachable service into a
     failure instead.
+
+A third axis, orthogonal to both: which *database* the ledger runs on. Every
+test above runs unmodified against SQLite by default, and against real
+Postgres when TEST_LEDGER_DSN is set — see `ledger_path` below. CI's
+"Facilitator + tests (Postgres)" job sets it against a postgres:16 service
+container, which is the actual proof that facilitator/db.py's dialect shim
+did not quietly break the money-handling code it sits in front of.
 """
 
 from __future__ import annotations
@@ -35,15 +42,59 @@ TEST_SECRET = "test-secret-not-the-demo-one"
 RESOURCE_URL = os.getenv("RESOURCE_URL", "http://localhost:3402/premium/market-report")
 FACILITATOR_URL = os.getenv("FACILITATOR_URL", "http://localhost:8402")
 
+# A postgres:// URL, set only by the CI job that runs this suite against real
+# Postgres. Unset everywhere else, including local dev — this project has no
+# Postgres available on the machine it was built on, so "run pytest" staying
+# SQLite-only by default is what keeps that true.
+TEST_LEDGER_DSN = os.getenv("TEST_LEDGER_DSN")
+
+
+def _reset_postgres_ledger(dsn: str) -> None:
+    """Makes one shared Postgres database look like a fresh SQLite file.
+
+    TEST_LEDGER_DSN points every test in a run at the *same* physical
+    database — there is no cheap per-test-database equivalent to a throwaway
+    SQLite file — so isolation comes from resetting state before each test
+    instead of from a fresh file. Ensures the schema exists first (the
+    container starts genuinely empty and nothing else has necessarily run
+    yet), then empties every table.
+
+    `TRUNCATE ... RESTART IDENTITY` also resets the `events.id` sequence, so
+    ids stay small and predictable the same way a fresh SQLite file's would.
+    """
+    import psycopg
+    from ledger import schema_sql
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        for statement in schema_sql("postgres").split(";"):
+            statement = statement.strip()
+            if statement:
+                conn.execute(statement)
+        conn.execute(
+            "TRUNCATE TABLE offers, batches, commitments, events RESTART IDENTITY CASCADE"
+        )
+
 
 @pytest.fixture
 def ledger_path(tmp_path):
-    """A fresh ledger file per test.
+    """A connection string for one test's worth of fresh, isolated ledger.
 
-    Settlement sweeps every pending commitment in the database, so tests that
-    shared one would interfere in ways that depend on execution order.
+    Defaults to a throwaway SQLite file path. When TEST_LEDGER_DSN is set,
+    returns that Postgres URL instead, after truncating it — every test in
+    the suite that takes `ledger_path` (directly, or via the `ledger` and
+    `facilitator_app` fixtures below) then runs against real Postgres with
+    no change to the test itself. The name stays `ledger_path` for exactly
+    that reason: nothing downstream needs to know which engine it got.
+
+    Settlement sweeps every pending commitment in the database, so tests
+    that shared state would interfere in ways that depend on execution
+    order — for SQLite that is naturally avoided by a fresh file; for the
+    shared Postgres database it is why this resets before every test.
     """
-    return tmp_path / "ledger.db"
+    if TEST_LEDGER_DSN:
+        _reset_postgres_ledger(TEST_LEDGER_DSN)
+        return TEST_LEDGER_DSN
+    return str(tmp_path / "ledger.db")
 
 
 @pytest.fixture

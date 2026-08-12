@@ -125,7 +125,16 @@ ENABLE_DEMO_API = os.getenv("ENABLE_DEMO_API", "false").strip().lower() in ("1",
 # make itself (see demo_trace.py for why).
 RESOURCE_URL = os.getenv("RESOURCE_URL", "http://localhost:3402")
 
-ledger = Ledger(os.getenv("LEDGER_DB_PATH") or str(SERVICE_DIR / "data" / "ledger.db"))
+# LEDGER_DSN (a postgres:// URL) takes priority when set — that is the
+# production path. LEDGER_DB_PATH is the SQLite file path this project has
+# always used, kept as the fallback so local dev and every existing .env
+# needs no change. Ledger itself decides which engine a string means; see
+# db.dialect_for.
+ledger = Ledger(
+    os.getenv("LEDGER_DSN")
+    or os.getenv("LEDGER_DB_PATH")
+    or str(SERVICE_DIR / "data" / "ledger.db")
+)
 gateway = RazorpayGateway(
     key_id=os.getenv("RAZORPAY_KEY_ID"),
     key_secret=os.getenv("RAZORPAY_KEY_SECRET"),
