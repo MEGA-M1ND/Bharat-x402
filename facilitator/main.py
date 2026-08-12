@@ -42,7 +42,8 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from ledger import Ledger, today_utc
 from payment_verifier import (
@@ -107,6 +108,64 @@ app = FastAPI(
     description="INR settlement facilitator for the x402 agent payment protocol.",
     version="0.3.0",
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def malformed_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Records a request this service could not even parse.
+
+    FastAPI's default 422 is fine for the caller but tells the operator
+    nothing. A malformed /verify body is a real event — a client integrating
+    against the wrong shape, or something probing the endpoint — and it belongs
+    in the audit trail alongside the payments that were rejected for better
+    reasons.
+    """
+    ledger.log_event(
+        "malformed_request",
+        status="rejected",
+        path=request.url.path,
+        reason="validation_error",
+        errors=[
+            {"field": ".".join(str(part) for part in err.get("loc", [])), "problem": err.get("msg")}
+            for err in exc.errors()[:5]
+        ],
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid_request",
+            "message": "Request body does not match this endpoint's schema.",
+            "detail": exc.errors()[:5],
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+    """Last line of defence: nothing leaves this service unlogged.
+
+    An unhandled exception in a payment path is the worst kind of silent
+    failure — the caller sees a 500 and the operator sees nothing. This records
+    what broke and where before answering.
+
+    It deliberately does not leak the exception text to the caller. An error
+    from deep in the ledger or the Razorpay SDK can carry connection strings or
+    key fragments, and the caller here is an untrusted agent.
+    """
+    ledger.log_event(
+        "unhandled_error",
+        status="rejected",
+        path=request.url.path,
+        reason=type(exc).__name__,
+        message=str(exc)[:500],
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_error",
+            "message": "The facilitator failed to process this request. It has been logged.",
+        },
+    )
 
 
 @app.on_event("startup")
@@ -664,6 +723,8 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
                 commitmentCount=len(commitment_ids),
                 settleDate=settle_date,
             )
+            # Same keys as a real batch, with the gateway fields null. A client
+            # should not have to branch on `status` just to read a response.
             batches.append(
                 {
                     "batchId": None,
@@ -673,6 +734,9 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
                     "totalPaise": total,
                     "humanTotal": format_paise(total),
                     "status": "dry_run",
+                    "paymentLinkId": None,
+                    "paymentLinkUrl": None,
+                    "razorpayMode": gateway.mode,
                     "economics": economics,
                 }
             )
@@ -720,10 +784,16 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
                 {
                     "batchId": batch_id,
                     "agentId": agent_id,
-                    "status": "failed",
-                    "error": str(exc),
+                    "settleDate": settle_date,
                     "commitmentCount": len(commitment_ids),
                     "totalPaise": total,
+                    "humanTotal": format_paise(total),
+                    "status": "failed",
+                    "paymentLinkId": None,
+                    "paymentLinkUrl": None,
+                    "razorpayMode": gateway.mode,
+                    "error": str(exc),
+                    "economics": economics,
                 }
             )
             continue
