@@ -34,7 +34,9 @@ jobs:
       - name: Lint
         run: ruff check facilitator demo-agent reporting tests
 
-      - name: Test
+      # No services running here, so the integration tests skip. They are run
+      # for real in the smoke job below, where a skip is made fatal.
+      - name: Unit and service tests
         run: pytest tests -v
 
   node:
@@ -79,6 +81,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r facilitator/requirements.txt -r demo-agent/requirements.txt
+          pip install pytest
           npm --prefix resource-server ci
 
       # No secrets in CI: MOCK_RAZORPAY keeps the facilitator from making any
@@ -140,6 +143,14 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' \
             http://localhost:3402/free/market-report-preview)
           test "$status" = "200"
+
+      # The full suite against live services. REQUIRE_INTEGRATION turns an
+      # unreachable service into a failure instead of a skip — a suite that
+      # quietly stops testing the thing it exists to test is worse than none.
+      - name: Full test suite against live services
+        env:
+          REQUIRE_INTEGRATION: "1"
+        run: pytest tests -v
 
       # The whole point, asserted end to end: quote an offer, sign acceptance,
       # present it, get the content and a settlement receipt back.
