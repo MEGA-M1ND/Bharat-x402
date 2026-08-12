@@ -136,6 +136,33 @@ by `facilitator/scheduler.py --once`:
 | Gateway calls avoided | **55** |
 | **Revenue uncollectable per-request** | **₹30.00 of ₹30.00** — all 60 charges under the ₹1.00 minimum |
 
+### Verified against Razorpay's live test API
+
+Settlement was run against real `rzp_test_` credentials. Five Payment Links created, then
+fetched back from Razorpay and reconciled against the ledger — **₹35.00 committed, ₹35.00
+returned by the gateway**:
+
+```
+plink_TOk88dBGlGTOeq   ₹10.00  created  batch_8c97fac2aa0245f2  agent-claude-web
+plink_TOk89ZNUFJR7oG    ₹5.00  created  batch_7d0a155d342b4152  agent-gemini-crawler
+plink_TOk8A5M1elmqj1    ₹5.00  created  batch_fa3321b5dad24dbd  agent-gptbot
+plink_TOk8Af9Z4ofoHy   ₹10.00  created  batch_56e1ce6e4cc54b96  agent-perplexity-bot
+plink_TOk8BAFzBoaOuk    ₹5.00  created  batch_8059ae0b56cf45a0  agent-pytest
+```
+
+And the ₹1.00 floor this project is built around is not taken from documentation. Posting
+both amounts straight to `POST /v1/payment_links`, bypassing our own guard:
+
+```
+Rs 0.50 (50 paise)    REJECTED 400 -> "amount: amount should be minimum 1.00 for INR."
+Rs 1.00 (100 paise)   ACCEPTED     -> plink_TOk9oC7MhfFJqp
+```
+
+Razorpay also returns `429 Too many requests` when links are created back to back — so
+per-request settlement of agent traffic would not merely be uneconomic, it would exceed the
+gateway's request budget. Another argument for batching, found by running it rather than
+reasoning about it.
+
 ### On the number this project does *not* claim
 
 It would be easy to say "batching cut fees by 90%." **It doesn't.** On a pure percentage fee,
@@ -178,7 +205,10 @@ This is a portfolio demo, not a payment system.
 - It uses **Razorpay test-mode keys exclusively** and **refuses to start on an `rzp_live_`
   key** — not overridable by config. A project that creates Payment Links in a loop has no
   business holding a key that can move real money.
-- It runs fully offline with `MOCK_RAZORPAY=true`, which is the default.
+- It runs fully offline with `MOCK_RAZORPAY=true`, which is the default. Set your own
+  `rzp_test_` keys and flip it to `false` to create real test-mode links.
+- **No webhook handling.** Links are created and reconciled, but a link that is actually
+  *paid* does not update the ledger — production needs a `payment_link.paid` webhook.
 - Payment proofs use **HMAC with a shared secret**, not per-agent keypairs. That is a real
   downgrade from x402's EIP-3009 signatures — there is no non-repudiation, since the
   facilitator holds the key it verifies with. It is documented at the top of

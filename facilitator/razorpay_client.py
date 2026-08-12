@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from dataclasses import dataclass
 
 import razorpay
@@ -51,6 +52,17 @@ import razorpay
 
 class RazorpayConfigError(Exception):
     """The facilitator is configured in a way that is unsafe to run."""
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """Whether an SDK error is Razorpay's 429.
+
+    The Python SDK collapses HTTP status into a small set of exception classes
+    and puts the detail in the message, so there is no status code to read —
+    matching on the text is the available option.
+    """
+    text = str(exc).lower()
+    return "too many requests" in text or "429" in text or "rate limit" in text
 
 
 @dataclass
@@ -323,6 +335,53 @@ class RazorpayGateway:
                 "currency": "INR",
             }
 
+        return self._create_with_retry(
+            amount_paise=amount_paise,
+            description=description,
+            reference_id=reference_id,
+            agent_id=agent_id,
+            notes=notes,
+        )
+
+    def _create_with_retry(
+        self,
+        *,
+        amount_paise: int,
+        description: str,
+        reference_id: str,
+        agent_id: str,
+        notes: dict | None,
+        attempts: int = 4,
+    ) -> dict:
+        """Creates a Payment Link, backing off on rate limits.
+
+        Razorpay rate-limits its API, and a settlement run creates one link per
+        paying agent back to back — so a publisher with fifty crawlers hits 429
+        partway through the loop. Found by running this against the real test
+        API, not by reading the docs.
+
+        Retrying only on 429 is deliberate. A rejected amount or a bad
+        reference id will fail identically every time; retrying those would
+        just delay the error report.
+
+        (Worth noting the rate limit is itself another argument for batching.
+        Per-request settlement of agent traffic would not merely be expensive —
+        it would exceed the gateway's request budget.)
+
+        Args:
+            amount_paise: Total to charge.
+            description: Shown to the payer.
+            reference_id: Our batch id; Razorpay enforces uniqueness on it.
+            agent_id: Paying agent, recorded in notes.
+            notes: Extra metadata.
+            attempts: How many times to try before giving up.
+
+        Returns:
+            The created link.
+
+        Raises:
+            Exception: The last error, if every attempt failed.
+        """
         payload = {
             "amount": amount_paise,
             "currency": "INR",
@@ -341,12 +400,26 @@ class RazorpayGateway:
             },
         }
 
-        link = self._client.payment_link.create(payload)
-        return {
-            "id": link["id"],
-            "short_url": link.get("short_url"),
-            "status": link.get("status", "created"),
-            "mode": self.mode,
-            "amount": link.get("amount", amount_paise),
-            "currency": link.get("currency", "INR"),
-        }
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                link = self._client.payment_link.create(payload)
+            except Exception as exc:  # noqa: BLE001 - inspected, then re-raised below
+                last_error = exc
+                if not _is_rate_limited(exc) or attempt == attempts - 1:
+                    raise
+                # 1s, 2s, 4s. Razorpay's window is short; this clears it
+                # without making a settlement run feel hung.
+                time.sleep(2**attempt)
+                continue
+
+            return {
+                "id": link["id"],
+                "short_url": link.get("short_url"),
+                "status": link.get("status", "created"),
+                "mode": self.mode,
+                "amount": link.get("amount", amount_paise),
+                "currency": link.get("currency", "INR"),
+            }
+
+        raise last_error  # pragma: no cover - loop always returns or raises
