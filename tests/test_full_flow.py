@@ -346,6 +346,51 @@ class TestRazorpayGuards:
     def test_missing_credentials_fall_back_to_mock(self):
         assert RazorpayGateway(key_id="", key_secret="").mock is True
 
+    def test_mock_mode_needs_no_credentials(self):
+        ok, detail = RazorpayGateway(key_id="", key_secret="").check_credentials()
+        assert ok is True
+        assert "mock" in detail
+
+    def test_bad_credentials_are_caught_at_startup(self, monkeypatch):
+        """Broken keys must surface on boot, not at the end of the first day.
+
+        In deferred mode nothing touches Razorpay until settlement runs, so
+        without this check a facilitator comes up looking healthy and only
+        discovers its credentials are dead once a day of commitments is
+        already booked behind them.
+        """
+        gateway = RazorpayGateway(key_id="rzp_test_fake", key_secret="fake", mock=False)
+
+        class RejectingLinks:
+            @staticmethod
+            def all(*args, **kwargs):
+                raise Exception("Authentication failed")
+
+        monkeypatch.setattr(gateway, "_client", type("C", (), {"payment_link": RejectingLinks})())
+
+        ok, detail = gateway.check_credentials()
+        assert ok is False
+        assert "same key pair" in detail
+
+    def test_credential_failure_does_not_fall_back_to_mock(self, monkeypatch):
+        """A gateway that cannot authenticate must not quietly fake payments.
+
+        Degrading to mock on an auth error would report settled revenue that
+        does not exist — worse than failing loudly.
+        """
+        gateway = RazorpayGateway(key_id="rzp_test_fake", key_secret="fake", mock=False)
+
+        class RejectingLinks:
+            @staticmethod
+            def all(*args, **kwargs):
+                raise Exception("Authentication failed")
+
+        monkeypatch.setattr(gateway, "_client", type("C", (), {"payment_link": RejectingLinks})())
+        gateway.check_credentials()
+
+        assert gateway.mock is False
+        assert gateway.mode == "razorpay_test"
+
     def test_below_minimum_charge_is_refused(self):
         """The constraint the whole project is built around."""
         gateway = RazorpayGateway(key_id="", key_secret="")

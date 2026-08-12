@@ -237,6 +237,44 @@ class RazorpayGateway:
         """Human-readable mode, for the ledger and reports."""
         return "mock" if self.mock else "razorpay_test"
 
+    def check_credentials(self) -> tuple[bool, str]:
+        """Confirms the configured keys actually authenticate.
+
+        Called at startup rather than left to be discovered at settlement time.
+        Without this, bad credentials surface only when the first batch runs —
+        which in deferred mode is hours after the service came up looking
+        healthy, with a day of commitments already booked against a gateway
+        that was never going to accept them.
+
+        Deliberately non-fatal. `/verify` and `/settle` do not touch Razorpay,
+        so a facilitator with broken credentials can still accept payments and
+        keep an accurate ledger; only `/settle-batch` is affected, and those
+        commitments stay pending until someone fixes the keys. Refusing to
+        start would turn a settlement problem into an outage.
+
+        Returns:
+            `(ok, message)` — message explains the failure when ok is False.
+        """
+        if self.mock:
+            return True, "mock mode — no credentials needed"
+
+        try:
+            # Cheapest authenticated read available. `count=1` keeps the
+            # response tiny; we care only about the status code.
+            self._client.payment_link.all({"count": 1})
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
+            detail = str(exc)
+            if "Authentication failed" in detail or "401" in detail:
+                return False, (
+                    "Razorpay rejected these credentials. The key id and secret must come "
+                    "from the same key pair — Razorpay shows a secret only once, when it is "
+                    "generated, so a regenerated key leaves the old secret dead while the old "
+                    "key id still looks plausible. Re-copy both from the dashboard."
+                )
+            return False, f"Could not reach Razorpay: {detail}"
+
+        return True, "credentials accepted"
+
     def create_payment_link(
         self,
         *,

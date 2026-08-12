@@ -192,6 +192,22 @@ def announce() -> None:
         offerTtlSeconds=OFFER_POLICY.ttl_seconds,
     )
 
+    # Find out now whether settlement will actually work, rather than at the
+    # end of the first day with a ledger full of commitments behind it.
+    ok, detail = gateway.check_credentials()
+    ledger.log_event(
+        "razorpay_credentials_ok" if ok else "razorpay_credentials_invalid",
+        status="ok" if ok else "rejected",
+        razorpayMode=gateway.mode,
+        message=detail,
+        note=None
+        if ok
+        else (
+            "Payments will still be verified and committed to the ledger. "
+            "Only /settle-batch is affected; those commitments stay pending."
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Request models
