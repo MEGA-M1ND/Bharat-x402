@@ -61,15 +61,19 @@ def _reset_postgres_ledger(dsn: str) -> None:
 
     `TRUNCATE ... RESTART IDENTITY` also resets the `events.id` sequence, so
     ids stay small and predictable the same way a fresh SQLite file's would.
+
+    Reuses `db._split_sql_statements` rather than splitting on `;` again
+    here — a second hand-rolled splitter is exactly how this project's own
+    schema comment (its own semicolon, mid-sentence) broke the *first* one
+    without anyone noticing until real Postgres said so in CI.
     """
     import psycopg
+    from db import _split_sql_statements
     from ledger import schema_sql
 
     with psycopg.connect(dsn, autocommit=True) as conn:
-        for statement in schema_sql("postgres").split(";"):
-            statement = statement.strip()
-            if statement:
-                conn.execute(statement)
+        for statement in _split_sql_statements(schema_sql("postgres")):
+            conn.execute(statement)
         conn.execute(
             "TRUNCATE TABLE offers, batches, commitments, events RESTART IDENTITY CASCADE"
         )
