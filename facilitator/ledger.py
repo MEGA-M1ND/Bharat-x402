@@ -388,13 +388,26 @@ class Ledger:
         registered_at = utc_now()
 
         with _WRITE_LOCK, self._connect() as conn:
-            try:
-                conn.execute(
-                    "INSERT INTO agents (agent_id, public_key, algorithm, registered_at)"
-                    " VALUES (?, ?, ?, ?)",
-                    (agent_id, public_key, algorithm, registered_at),
-                )
-            except db.UniqueConstraintError:
+            # `ON CONFLICT DO NOTHING` rather than catching a unique violation,
+            # for a dialect reason worth stating because SQLite hides it
+            # completely: in Postgres a failed statement aborts the entire
+            # transaction, and every subsequent command on that connection
+            # fails with InFailedSqlTransaction until it is rolled back. So the
+            # obvious try/except INSERT, then SELECT to see what is already
+            # there cannot work — the recovery read is itself refused. SQLite
+            # has no such rule and passes it happily, which is exactly why the
+            # suite runs against both engines.
+            #
+            # This is also simply better: one statement does the claim, so
+            # there is no read-then-write gap, the same reasoning as
+            # `create_commitment` below.
+            inserted = conn.execute(
+                "INSERT INTO agents (agent_id, public_key, algorithm, registered_at)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT (agent_id) DO NOTHING",
+                (agent_id, public_key, algorithm, registered_at),
+            )
+
+            if inserted.rowcount == 0:
                 existing = conn.execute(
                     "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
                 ).fetchone()
@@ -411,7 +424,7 @@ class Ledger:
                     }
                 raise ValueError(
                     f"agent {agent_id} is already registered with a different public key"
-                ) from None
+                )
 
         return {
             "agentId": agent_id,
@@ -706,16 +719,19 @@ class Ledger:
             processed and should be acknowledged without further action.
         """
         with _WRITE_LOCK, self._connect() as conn:
-            try:
-                conn.execute(
-                    "INSERT INTO webhook_events"
-                    " (dedupe_key, event, received_at, payment_link_id, outcome)"
-                    " VALUES (?, ?, ?, ?, 'claimed')",
-                    (dedupe_key, event, utc_now(), payment_link_id),
-                )
-            except db.UniqueConstraintError:
-                return False
-        return True
+            # Same `ON CONFLICT DO NOTHING` as `register_agent`, and for the
+            # same reason: a caught unique violation leaves a Postgres
+            # transaction aborted, so nothing else can run on that connection
+            # afterwards. Nothing does here *today*, which is the trap — the
+            # next person to add a statement below this line would find it
+            # failing for a reason that has nothing to do with what they wrote.
+            claimed = conn.execute(
+                "INSERT INTO webhook_events"
+                " (dedupe_key, event, received_at, payment_link_id, outcome)"
+                " VALUES (?, ?, ?, ?, 'claimed') ON CONFLICT (dedupe_key) DO NOTHING",
+                (dedupe_key, event, utc_now(), payment_link_id),
+            )
+            return claimed.rowcount == 1
 
     def finish_webhook(self, *, dedupe_key: str, outcome: str, **detail: Any) -> None:
         """Records how a claimed webhook delivery turned out."""
