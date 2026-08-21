@@ -47,12 +47,15 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from ledger import Ledger, today_utc
+from ledger import Ledger, redact_credentials, today_utc
 from payment_verifier import (
+    ALGORITHM,
+    KeyFormatError,
     OfferPolicy,
     VerificationError,
     agent_commitment_body,
     build_offer,
+    load_public_key,
     sign,
     verify_payment_proof,
 )
@@ -92,6 +95,23 @@ SETTLEMENT_MODE = os.getenv("SETTLEMENT_MODE", "deferred")
 
 HMAC_SECRET = os.getenv("FACILITATOR_HMAC_SECRET", "dev-only-shared-secret-change-me")
 
+# Whether an agent with no registered Ed25519 key may still pay with a
+# shared-secret HMAC proof. True by default so existing clients — the CLI
+# agent's older invocations, anything written against the previous protocol —
+# keep working while keys roll out. Set false to require registration, which
+# is the end state: see payment_verifier.py on why a shared secret cannot
+# provide non-repudiation no matter how strong the MAC is.
+ALLOW_HMAC_FALLBACK = os.getenv("ALLOW_HMAC_FALLBACK", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Razorpay's webhook signing secret, from the dashboard's webhook settings.
+# Unset means the webhook endpoint refuses every delivery rather than
+# accepting unauthenticated ledger writes — see webhooks.py.
+RAZORPAY_WEBHOOK_SECRET = (os.getenv("RAZORPAY_WEBHOOK_SECRET") or "").strip()
+
 OFFER_POLICY = OfferPolicy(
     ttl_seconds=int(os.getenv("OFFER_TTL_SECONDS", "300")),
     scheme=X402_SCHEME,
@@ -120,10 +140,24 @@ ALLOW_GLOBAL_SETTLE = os.getenv("ALLOW_GLOBAL_SETTLE", "true").strip().lower() i
 # which is fine for a demo deployment and not something to expose silently.
 ENABLE_DEMO_API = os.getenv("ENABLE_DEMO_API", "false").strip().lower() in ("1", "true", "yes")
 
-# Where the publisher's resource server lives — only used by the demo API,
-# to make the real cross-service HTTP calls a browser client can't safely
-# make itself (see demo_trace.py for why).
-RESOURCE_URL = os.getenv("RESOURCE_URL", "http://localhost:3402")
+# Where the publisher's resource server lives — only used by the demo API, to
+# make the real cross-service HTTP calls a browser client can't safely make
+# itself (see demo_trace.py for why). A service binding would be the
+# lower-latency choice here, but Vercel rejects a binding in this direction:
+# the resource server already binds to the facilitator for its own /verify
+# and /settle calls, and a facilitator->resource binding on top of that forms
+# a circular binding, which Vercel's services model refuses to deploy. So the
+# demo agent instead calls the resource server's real public URL — which,
+# for a demo whose whole point is showing an agent's actual HTTP traffic, is
+# arguably more honest anyway. Derived from VERCEL_PROJECT_PRODUCTION_URL
+# rather than VERCEL_URL for the same reason server.js computes its
+# FACILITATOR_PUBLIC_URL that way: VERCEL_URL points at the current
+# deployment, which sits behind Deployment Protection on a preview.
+RESOURCE_URL = os.getenv("RESOURCE_URL") or (
+    f"https://{os.environ['VERCEL_PROJECT_PRODUCTION_URL']}"
+    if os.getenv("VERCEL_PROJECT_PRODUCTION_URL")
+    else "http://localhost:3402"
+)
 
 # LEDGER_DSN (a postgres:// URL) takes priority when set — that is the
 # production path. LEDGER_DB_PATH is the SQLite file path this project has
@@ -161,6 +195,11 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"],
 )
+
+import webhooks  # noqa: E402 - imported here, after `ledger` exists to configure it with
+
+webhooks.configure(ledger=ledger, webhook_secret=RAZORPAY_WEBHOOK_SECRET)
+app.include_router(webhooks.router)
 
 if ENABLE_DEMO_API:
     import demo_trace
@@ -232,38 +271,55 @@ async def unhandled_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-@app.on_event("startup")
-def announce() -> None:
-    """Logs the configuration the facilitator actually came up with.
+# Whether the startup hook below runs at all. On by default — local dev, CI,
+# and the test suite all want to know immediately if Razorpay credentials are
+# bad, per the whole point of this hook (see docs/demo-script.md). A
+# serverless cold start pays for it on every single invocation instead of
+# once per process lifetime, though: two Postgres log writes and, in real
+# Razorpay mode, one outbound API call, on every cold start. Vercel sets this
+# to "0" — the deployed demo runs in MOCK_RAZORPAY anyway, where
+# check_credentials() is a constant with no network call, so there is nothing
+# useful for the hook to catch there regardless.
+FACILITATOR_STARTUP_CHECK = os.getenv("FACILITATOR_STARTUP_CHECK", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-    Worth being loud about: whether real Razorpay calls will happen is the one
-    thing an operator most needs to know at a glance.
-    """
-    ledger.log_event(
-        "facilitator_started",
-        status="ok",
-        settlementMode=SETTLEMENT_MODE,
-        razorpayMode=gateway.mode,
-        network=X402_NETWORK,
-        scheme=X402_SCHEME,
-        offerTtlSeconds=OFFER_POLICY.ttl_seconds,
-    )
+if FACILITATOR_STARTUP_CHECK:
 
-    # Find out now whether settlement will actually work, rather than at the
-    # end of the first day with a ledger full of commitments behind it.
-    ok, detail = gateway.check_credentials()
-    ledger.log_event(
-        "razorpay_credentials_ok" if ok else "razorpay_credentials_invalid",
-        status="ok" if ok else "rejected",
-        razorpayMode=gateway.mode,
-        message=detail,
-        note=None
-        if ok
-        else (
-            "Payments will still be verified and committed to the ledger. "
-            "Only /settle-batch is affected; those commitments stay pending."
-        ),
-    )
+    @app.on_event("startup")
+    def announce() -> None:
+        """Logs the configuration the facilitator actually came up with.
+
+        Worth being loud about: whether real Razorpay calls will happen is the
+        one thing an operator most needs to know at a glance.
+        """
+        ledger.log_event(
+            "facilitator_started",
+            status="ok",
+            settlementMode=SETTLEMENT_MODE,
+            razorpayMode=gateway.mode,
+            network=X402_NETWORK,
+            scheme=X402_SCHEME,
+            offerTtlSeconds=OFFER_POLICY.ttl_seconds,
+        )
+
+        # Find out now whether settlement will actually work, rather than at
+        # the end of the first day with a ledger full of commitments behind it.
+        ok, detail = gateway.check_credentials()
+        ledger.log_event(
+            "razorpay_credentials_ok" if ok else "razorpay_credentials_invalid",
+            status="ok" if ok else "rejected",
+            razorpayMode=gateway.mode,
+            message=detail,
+            note=None
+            if ok
+            else (
+                "Payments will still be verified and committed to the ledger. "
+                "Only /settle-batch is affected; those commitments stay pending."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +338,14 @@ class OfferRequest(BaseModel):
     scheme: str = Field(default=X402_SCHEME)
     network: str = Field(default=X402_NETWORK)
     resourceUrl: str | None = Field(default=None)
+
+
+class AgentRegistration(BaseModel):
+    """An agent announcing the public half of its signing key."""
+
+    agentId: str = Field(..., min_length=1, max_length=64)
+    publicKey: str = Field(..., description="Base64 of the raw 32-byte Ed25519 public key.")
+    algorithm: str = Field(default=ALGORITHM)
 
 
 class X402Request(BaseModel):
@@ -336,8 +400,14 @@ def supported() -> dict:
                     "settlementRail": "razorpay",
                     "settlementMode": SETTLEMENT_MODE,
                     "razorpayMode": gateway.mode,
-                    # Named honestly: this is not the EVM signature scheme.
-                    "proofScheme": "hmac-sha256",
+                    # Named honestly: this is not the EVM signature scheme,
+                    # but it is now a real asymmetric one — the agent signs
+                    # with a key the facilitator does not hold.
+                    "proofScheme": ALGORITHM,
+                    "registrationEndpoint": "/agents/register",
+                    # Advertised so a client knows whether it *must* register
+                    # before paying, rather than discovering it at settlement.
+                    "hmacFallbackAllowed": ALLOW_HMAC_FALLBACK,
                     "offerEndpoint": "/offer",
                     "minimumChargePaise": fee_model.minimum_charge_paise,
                 },
@@ -349,6 +419,130 @@ def supported() -> dict:
         # Our equivalent is the merchant account rupees land in.
         "signers": {"razorpay:*": [FACILITATOR_ACCOUNT]},
     }
+
+
+def _agent_key_for(offer_row: Any | None) -> Any | None:
+    """The registered signing key of the agent an offer was issued to.
+
+    Looks the agent up by `offer_row["agent_id"]` — the id the *facilitator*
+    bound the offer to when it quoted — and never by the `agentId` in the
+    caller-supplied payload.
+
+    That distinction is load-bearing. Keying off the payload would let an
+    attacker holding a registered agent's offer present it under some
+    unregistered id, find no key on file, and be dropped onto the HMAC
+    fallback path. Reading the id from our own record means the choice of
+    which key must verify is not something the caller can influence.
+    """
+    if offer_row is None:
+        return None
+    return ledger.get_agent(offer_row["agent_id"])
+
+
+@app.post("/agents/register")
+def register_agent(request: AgentRegistration) -> JSONResponse:
+    """Registers an agent's Ed25519 public key.
+
+    The step that replaces "everyone shares one secret". After this, the
+    facilitator can verify that agent's commitments and cannot produce them,
+    which is what makes a commitment usable as evidence in a dispute rather
+    than merely as a checksum.
+
+    First registration wins. Re-sending the same key is a no-op so a restarted
+    agent need not track whether it has registered before; sending a
+    *different* key for an existing id is refused, because silently accepting
+    it would make key rotation and account takeover the same request. Rotation
+    for real needs an authenticated channel, which this demo does not have —
+    see `Ledger.register_agent` on the trust-on-first-use limitation.
+
+    Returns:
+        The stored registration, or 400/409 on a bad or conflicting key.
+    """
+    if request.algorithm != ALGORITHM:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unsupported_algorithm",
+                "message": f"This facilitator verifies {ALGORITHM} signatures only.",
+            },
+        )
+
+    # Parse before storing. A key that cannot be loaded would otherwise be
+    # accepted here and only fail later, at settlement time, as a mysterious
+    # invalid_signature on a proof that was actually fine.
+    try:
+        load_public_key(request.publicKey)
+    except KeyFormatError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_public_key", "message": str(exc)},
+        )
+
+    try:
+        registration = ledger.register_agent(
+            agent_id=request.agentId,
+            public_key=request.publicKey,
+            algorithm=request.algorithm,
+        )
+    except ValueError as exc:
+        ledger.log_event(
+            "agent_key_conflict",
+            agent_id=request.agentId,
+            status="rejected",
+            reason="already_registered",
+            message=str(exc),
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "agent_already_registered",
+                "message": (
+                    f"{exc}. Key rotation needs an authenticated channel this demo does "
+                    "not implement — deliberately, rather than by allowing a rebind that "
+                    "would let anyone take over an agent id."
+                ),
+            },
+        )
+
+    ledger.log_event(
+        "agent_registered" if registration["created"] else "agent_registration_replayed",
+        agent_id=request.agentId,
+        status="ok",
+        algorithm=request.algorithm,
+        # The public key is safe to log — that is the whole point of it.
+        publicKey=request.publicKey,
+    )
+
+    return JSONResponse(status_code=200, content=registration)
+
+
+@app.get("/agents/{agent_id}")
+def get_agent(agent_id: str) -> JSONResponse:
+    """Returns an agent's registered public key, if it has one.
+
+    Public on purpose. A public key is not a secret, and exposing it lets a
+    publisher — or an auditor settling a dispute — independently verify a
+    commitment against the key on file without asking the facilitator to
+    mark its own homework.
+    """
+    row = ledger.get_agent(agent_id)
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "agent_not_registered",
+                "message": f"No signing key registered for {agent_id}.",
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "agentId": row["agent_id"],
+            "publicKey": row["public_key"],
+            "algorithm": row["algorithm"],
+            "registeredAt": row["registered_at"],
+        },
+    )
 
 
 @app.post("/verify")
@@ -376,6 +570,8 @@ def verify(request: X402Request) -> JSONResponse:
             offer_row=offer_row,
             requirements=requirements,
             secret=HMAC_SECRET,
+            agent_key=_agent_key_for(offer_row),
+            allow_hmac_fallback=ALLOW_HMAC_FALLBACK,
         )
     except VerificationError as exc:
         # Every rejection is recorded with its reason. "The payment failed" is
@@ -405,6 +601,11 @@ def verify(request: X402Request) -> JSONResponse:
         amount_paise=result["amountPaise"],
         status="ok",
         offerId=result["offerId"],
+        proofScheme=result["proofScheme"],
+        # Surfaced on every fallback verification rather than only at rollout,
+        # so a migration that quietly never finishes is visible in the audit
+        # trail instead of being mistaken for a completed one.
+        downgraded=result["proofScheme"] != ALGORITHM,
     )
 
     return JSONResponse(
@@ -416,6 +617,7 @@ def verify(request: X402Request) -> JSONResponse:
                 "offerId": result["offerId"],
                 "settlementMode": SETTLEMENT_MODE,
                 "humanAmount": format_paise(result["amountPaise"]),
+                "proofScheme": result["proofScheme"],
             },
         },
     )
@@ -472,6 +674,8 @@ def settle(request: X402Request) -> JSONResponse:
             offer_row=offer_row,
             requirements=requirements,
             secret=HMAC_SECRET,
+            agent_key=_agent_key_for(offer_row),
+            allow_hmac_fallback=ALLOW_HMAC_FALLBACK,
         )
     except VerificationError as exc:
         return failure(exc.reason, exc.message)
@@ -991,13 +1195,41 @@ def ledger_events(
 
 
 @app.get("/health")
-def health() -> dict:
-    return {
+def health() -> JSONResponse:
+    """Liveness, plus whether the ledger is actually reachable.
+
+    Added after a Supabase project went away underneath a running deployment
+    and every ledger-backed endpoint started returning a bare 500. The
+    service was up, the database was not, and nothing distinguished those two
+    cases from outside — which is the difference between a five-minute fix and
+    an afternoon.
+
+    The probe is a `SELECT 1`, so it costs a round trip and no table access.
+    A failing ledger makes this endpoint 503 rather than 200-with-a-sad-field:
+    a load balancer or uptime check reads the status code, and a facilitator
+    that cannot write commitments is not healthy in any useful sense.
+    """
+    ledger_ok, ledger_detail = ledger.check_connection()
+
+    body = {
         "service": "facilitator",
-        "status": "ok",
+        "status": "ok" if ledger_ok else "degraded",
         "settlementMode": SETTLEMENT_MODE,
         "razorpayMode": gateway.mode,
+        "ledger": {
+            "engine": ledger.dialect,
+            "reachable": ledger_ok,
+            # Scrubbed again at the boundary, even though `check_connection`
+            # already does it. This string comes from a database driver and
+            # goes out over HTTP; one redaction is a behaviour, two is an
+            # invariant that survives someone changing either side.
+            "detail": redact_credentials(ledger_detail),
+        },
+        "webhooksConfigured": bool(RAZORPAY_WEBHOOK_SECRET),
+        "proofScheme": ALGORITHM,
+        "hmacFallbackAllowed": ALLOW_HMAC_FALLBACK,
     }
+    return JSONResponse(status_code=200 if ledger_ok else 503, content=body)
 
 
 @app.get("/")
@@ -1010,9 +1242,36 @@ def root() -> dict:
         "razorpayMode": gateway.mode,
         "x402Endpoints": ["/supported", "/verify", "/settle"],
         "inrEndpoints": ["/offer", "/settle-batch"],
+        "identityEndpoints": ["/agents/register", "/agents/{agentId}"],
+        "webhookEndpoints": ["/webhooks/razorpay"],
         "operational": ["/health", "/ledger/summary", "/economics", "/ledger/events"],
         "demoApi": ["/demo/run"] if ENABLE_DEMO_API else [],
+        "proofScheme": ALGORITHM,
     }
+
+
+# ---------------------------------------------------------------------------
+# Vercel path-prefix hedge
+# ---------------------------------------------------------------------------
+#
+# On Vercel this service sits behind a rewrite from /api/facilitator/* on the
+# public URL (see vercel.json). Vercel's own documented mechanism for
+# stripping that prefix before a service sees it — a `request.path` transform
+# in the service's own `routes` — did not do so in practice: every
+# /api/facilitator/* path 404s from FastAPI's own not-found handler, meaning
+# the request arrives with the prefix still attached. Rather than depend on
+# that (still-experimental) platform feature, this mounts the whole app under
+# the prefix directly, which is ordinary ASGI and entirely under this
+# service's own control.
+#
+# Unset (the default, everywhere except Vercel) this changes nothing: `app`
+# is exactly what it already was, and every test in this project exercises
+# that `app` directly.
+_BASE_PATH = os.getenv("FACILITATOR_BASE_PATH", "").strip()
+if _BASE_PATH:
+    _inner_app = app
+    app = FastAPI()
+    app.mount(_BASE_PATH, _inner_app)
 
 
 if __name__ == "__main__":

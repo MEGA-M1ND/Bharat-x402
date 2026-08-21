@@ -74,8 +74,15 @@ def _reset_postgres_ledger(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as conn:
         for statement in _split_sql_statements(schema_sql("postgres")):
             conn.execute(statement)
+        # Every table, not just the money ones. `agents` and `webhook_events`
+        # both carry uniqueness constraints that are the *point* of them —
+        # first-registration-wins and exactly-once webhook delivery — so
+        # leaving either populated between tests makes a second run of the
+        # same test fail on a conflict that has nothing to do with the code
+        # under test. The SQLite path gets this free by using a fresh file.
         conn.execute(
-            "TRUNCATE TABLE offers, batches, commitments, events RESTART IDENTITY CASCADE"
+            "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events"
+            " RESTART IDENTITY CASCADE"
         )
 
 

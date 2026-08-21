@@ -227,13 +227,24 @@ class TestDbShim:
         assert statements == ["CREATE TABLE a (x INT)", "CREATE TABLE b (y INT)"]
 
     def test_split_sql_statements_against_the_real_schema(self):
-        """The actual schema, not a synthetic example — six statements, none
-        of them a comment fragment."""
+        """The actual schema, not a synthetic example: every statement is a
+        whole DDL statement and none is a fragment of a comment.
+
+        Counts CREATEs in the source rather than asserting a fixed number —
+        the bug this guards against is the splitter producing *fragments*,
+        which a literal count would flag every time the schema legitimately
+        gains a table, training everyone to update the number without
+        looking at what actually broke.
+        """
         from db import _split_sql_statements
         from ledger import schema_sql
 
-        statements = _split_sql_statements(schema_sql("postgres"))
-        assert len(statements) == 6
+        schema = schema_sql("postgres")
+        statements = _split_sql_statements(schema)
+
+        assert len(statements) == schema.upper().count("CREATE TABLE") + schema.upper().count(
+            "CREATE INDEX"
+        )
         for statement in statements:
             assert statement.upper().startswith(("CREATE TABLE", "CREATE INDEX")), statement
 
@@ -647,10 +658,66 @@ class TestErrorHandling:
 
     def test_health_reports_the_razorpay_mode(self, client):
         """Whether real charges can happen is the thing an operator must see."""
-        body = client.get("/health").json()
+        response = client.get("/health")
+        body = response.json()
+        assert response.status_code == 200
         assert body["status"] == "ok"
         assert body["razorpayMode"] == "mock"
         assert body["settlementMode"] == "deferred"
+        assert body["ledger"]["reachable"] is True
+
+    def test_health_goes_503_when_the_ledger_is_unreachable(self, client, monkeypatch):
+        """The case this endpoint was extended for: the service is up and the
+        database is not. Those must not look the same from outside — one is a
+        five-minute fix and the other is an afternoon.
+        """
+        import main
+
+        monkeypatch.setattr(
+            main.ledger, "check_connection", lambda: (False, "OperationalError: gone")
+        )
+
+        response = client.get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "degraded"
+        assert body["ledger"]["reachable"] is False
+        assert "OperationalError" in body["ledger"]["detail"]
+
+    def test_redact_credentials_strips_passwords_but_keeps_the_host(self):
+        """The host is what makes a connection error diagnosable; the password
+        is what must never reach a log line."""
+        from ledger import redact_credentials
+
+        redacted = redact_credentials(
+            "OperationalError: could not connect to "
+            "postgresql://postgres.abc:S3cretPw@db.ap-south-1.example.com:6543/postgres"
+        )
+        assert "S3cretPw" not in redacted
+        assert "postgres.abc" not in redacted
+        assert "db.ap-south-1.example.com:6543" in redacted
+
+    def test_redact_credentials_leaves_ordinary_text_alone(self):
+        """A scrubber that mangles every message makes errors unreadable and
+        gets removed by the next person to debug an outage."""
+        from ledger import redact_credentials
+
+        message = "OperationalError: server closed the connection unexpectedly"
+        assert redact_credentials(message) == message
+
+    def test_health_never_echoes_the_connection_string(self, client, monkeypatch):
+        """A DSN carries a password, and /health is the most casually-shared
+        endpoint in any service."""
+        import main
+
+        monkeypatch.setattr(
+            main.ledger,
+            "check_connection",
+            lambda: (False, "could not connect to postgres://user:hunter2@db.example.com/x"),
+        )
+
+        body = json.dumps(client.get("/health").json())
+        assert "hunter2" not in body
 
 
 class TestSettlement:

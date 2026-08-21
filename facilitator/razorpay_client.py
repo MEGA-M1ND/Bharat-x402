@@ -389,8 +389,15 @@ class RazorpayGateway:
             "description": description[:2048],
             "reference_id": reference_id,
             # No notifications: the payer here is an automated agent, not a
-            # person with an inbox. In production this is where a UPI Autopay
-            # mandate would replace the link entirely.
+            # person with an inbox.
+            #
+            # In production the link would not exist at all — it would be a
+            # UPI Reserve Pay (SBMD) mandate, which is the rail Razorpay's own
+            # agentic-payments product uses: funds are blocked up front under
+            # a consent with spend limits, and the agent debits within those
+            # limits without a checkout page or a PIN prompt per transaction.
+            # Specifically *not* UPI Autopay, which is fixed-schedule
+            # recurring collection and a different instrument.
             "notify": {"sms": False, "email": False},
             "reminder_enable": False,
             "notes": {

@@ -40,7 +40,46 @@ const {
 } = require("./x402-config");
 
 const PORT = Number(process.env.PORT || 3402);
-const FACILITATOR_URL = (process.env.FACILITATOR_URL || "http://localhost:8402").replace(/\/+$/, "");
+
+/**
+ * The facilitator URL a *browser* or external agent must use — embedded in
+ * 402 response bodies (`offer.facilitatorUrl`) and returned from `/api/info`
+ * for the console to call directly. Explicit `FACILITATOR_URL` wins; failing
+ * that, on Vercel this derives the public URL from `VERCEL_PROJECT_PRODUCTION_URL`
+ * rather than `VERCEL_URL` — preview deployments sit behind Deployment
+ * Protection, so a URL built from `VERCEL_URL` would hand external callers a
+ * link that 401s instead of answering `/supported`.
+ */
+const FACILITATOR_PUBLIC_URL = (
+  process.env.FACILITATOR_URL ||
+  (process.env.VERCEL_PROJECT_PRODUCTION_URL
+    ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}/api/facilitator`
+    : "http://localhost:8402")
+).replace(/\/+$/, "");
+
+/**
+ * The facilitator URL *this service's own server-side code* calls — for
+ * `/verify`, `/settle`, and the startup `/supported` check. On Vercel this
+ * prefers `FACILITATOR_INTERNAL_URL`, injected by the service binding in
+ * vercel.json: an internal call over a binding skips Deployment Protection,
+ * the public routing pipeline, and CDN accounting entirely, so it is strictly
+ * better than this service calling its sibling's own public URL. Falls back
+ * to the public URL so local dev (no binding, one process each) is unchanged.
+ *
+ * A binding URL points at the facilitator service's bare root — but the
+ * facilitator mounts its whole app under FACILITATOR_BASE_PATH (see
+ * facilitator/main.py's Vercel path-prefix hedge) regardless of which route
+ * a request arrives by, public rewrite or internal binding alike. So the
+ * same prefix has to be appended here too, or every internal call 404s even
+ * though the public route answers fine.
+ */
+const FACILITATOR_BASE_PATH = (process.env.FACILITATOR_BASE_PATH || "").replace(/\/+$/, "");
+const FACILITATOR_URL = (
+  process.env.FACILITATOR_INTERNAL_URL
+    ? `${process.env.FACILITATOR_INTERNAL_URL.replace(/\/+$/, "")}${FACILITATOR_BASE_PATH}`
+    : FACILITATOR_PUBLIC_URL
+).replace(/\/+$/, "");
+
 const PAY_TO = process.env.PAY_TO || "acc_BharatNewsNetwork";
 const PRICE = process.env.RESOURCE_PRICE || "₹5.00";
 
@@ -51,6 +90,13 @@ const PRICE = process.env.RESOURCE_PRICE || "₹5.00";
 const PRICE_MICRO = process.env.RESOURCE_PRICE_MICRO || "₹0.50";
 
 const app = express();
+
+// Vercel terminates TLS in front of this service and forwards the original
+// scheme via X-Forwarded-Proto. Without `trust proxy`, Express ignores that
+// header and reports every request as plain http — which leaks into the
+// resource URL the x402 middleware embeds in its own 402 body/headers.
+app.set("trust proxy", true);
+
 app.use(express.json());
 
 /**
@@ -169,7 +215,9 @@ const facilitatorClient = new HTTPFacilitatorClient({
  */
 const resourceServer = new x402ResourceServer(facilitatorClient).register(
   NETWORK,
-  new RazorpayInrScheme({ facilitatorUrl: FACILITATOR_URL })
+  // The *public* URL, deliberately: this is embedded in 402 bodies and read
+  // by the paying agent itself, which cannot resolve an internal binding URL.
+  new RazorpayInrScheme({ facilitatorUrl: FACILITATOR_PUBLIC_URL })
 );
 
 /**
@@ -202,7 +250,9 @@ const routes = buildRoutes({
   payTo: PAY_TO,
   price: PRICE,
   priceMicro: PRICE_MICRO,
-  facilitatorUrl: FACILITATOR_URL,
+  // Public URL: embedded in the 402 body's offer.facilitatorUrl, which the
+  // paying agent reads and calls back itself.
+  facilitatorUrl: FACILITATOR_PUBLIC_URL,
 });
 
 /**
@@ -334,7 +384,9 @@ app.get("/api/info", (_req, res) => {
     description: "Publisher content gated behind x402, priced in INR, settled via Razorpay.",
     scheme: SCHEME,
     network: NETWORK,
-    facilitator: FACILITATOR_URL,
+    // Public URL: the console (a browser) fetches this directly, and cannot
+    // resolve an internal service-binding URL.
+    facilitator: FACILITATOR_PUBLIC_URL,
     routes: {
       free: "/free/market-report-preview",
       paid: "/premium/market-report",
@@ -426,4 +478,14 @@ if (require.main === module) {
   start();
 }
 
-module.exports = { app, start, waitForFacilitator };
+/**
+ * Vercel's Express integration requires the app itself as the module's
+ * default export (https://vercel.com/docs/frameworks/backend/express) — an
+ * exported `{ app, start, ... }` object is not recognised and the deployment
+ * would silently serve nothing. `start`/`waitForFacilitator` are attached as
+ * properties of the (still-callable) app instead of living in a wrapper
+ * object, so local tooling that wants them can still reach them.
+ */
+app.start = start;
+app.waitForFacilitator = waitForFacilitator;
+module.exports = app;

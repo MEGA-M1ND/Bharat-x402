@@ -1,2 +1,7 @@
 httpx==0.28.1
 python-dotenv==1.0.1
+
+# The agent's own Ed25519 signing key. This is the side of the keypair that
+# matters: the private half is generated here, stored here, and never sent
+# anywhere — the facilitator only ever receives the public half.
+cryptography==46.0.3

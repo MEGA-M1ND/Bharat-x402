@@ -22,6 +22,19 @@
 --     > facilitator/migrations/001_init.sql
 --   (then restore this header comment above the generated SQL)
 
+
+-- One row per agent that has registered a signing key. Holds only the
+-- *public* half: the facilitator can verify an agent's commitments and can
+-- never produce one, which is the entire point of moving off a shared HMAC
+-- secret (see payment_verifier.py).
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id      TEXT PRIMARY KEY,
+    -- base64 of the raw 32-byte Ed25519 public key.
+    public_key    TEXT NOT NULL,
+    algorithm     TEXT NOT NULL,
+    registered_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id      TEXT PRIMARY KEY,
     agent_id      TEXT NOT NULL,
@@ -50,10 +63,18 @@ CREATE TABLE IF NOT EXISTS batches (
     -- What Razorpay gave us back. Null in dry-run.
     payment_link_id     TEXT,
     payment_link_url    TEXT,
-    -- created | failed | dry_run
+    -- created | paid | expired | cancelled | failed | dry_run
+    --
+    -- `created` means an invoice exists, NOT that money arrived. Only the
+    -- signed Razorpay webhook moves a batch to `paid` (see webhooks.py).
     status              TEXT NOT NULL,
     razorpay_mode       TEXT NOT NULL,
-    error_message       TEXT
+    error_message       TEXT,
+    -- Filled in by the webhook, not by the settlement run that created the
+    -- link. Null until Razorpay confirms payment.
+    paid_at             TEXT,
+    amount_paid_paise   INTEGER,
+    razorpay_payment_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS commitments (
@@ -90,6 +111,25 @@ CREATE TABLE IF NOT EXISTS events (
     detail       TEXT
 );
 
+-- Razorpay retries a webhook until it gets a 2xx, so the same event will
+-- arrive more than once as a matter of course — not as an edge case. The
+-- primary key is the dedupe guard: processing claims the key with an INSERT
+-- first, and a duplicate delivery loses that INSERT and returns early
+-- without touching a batch. Same discipline as `commitments.offer_id`:
+-- exactly-once is enforced by a database constraint, not by application
+-- logic remembering to check.
+CREATE TABLE IF NOT EXISTS webhook_events (
+    dedupe_key      TEXT PRIMARY KEY,
+    event           TEXT NOT NULL,
+    received_at     TEXT NOT NULL,
+    payment_link_id TEXT,
+    -- claimed | applied | ignored | unknown_link
+    outcome         TEXT NOT NULL,
+    detail          TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_commitments_settlement
     ON commitments (status, agent_id, settle_date);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+CREATE INDEX IF NOT EXISTS idx_batches_payment_link ON batches (payment_link_id);
+

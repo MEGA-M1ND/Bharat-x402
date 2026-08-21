@@ -26,3 +26,12 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+
+.vercel
+.env*
+
+# Agent signing keys. The private half of an Ed25519 keypair is the one thing
+# in this project that must exist in exactly one place — committing it would
+# turn the keypair back into the shared secret it was built to replace.
+.keys/
+*.key

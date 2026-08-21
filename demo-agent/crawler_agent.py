@@ -19,11 +19,19 @@ should be able to read a single run and understand the whole protocol without
 running anything themselves — so every step prints what it sent, what came
 back, and why that matters.
 
+Before any of that, once per identity, the agent registers the public half of
+its Ed25519 keypair with the facilitator. The private half is generated here
+and never sent anywhere — so the facilitator can check this agent's
+commitments and cannot manufacture one, which is what makes the proof worth
+anything in a dispute. See facilitator/payment_verifier.py for why a shared
+secret could not do that regardless of how strong the MAC was.
+
 Usage:
     python crawler_agent.py                          # one fetch, narrated
     python crawler_agent.py --count 8                # simulate a day of traffic
     python crawler_agent.py --agent-id agent-gptbot  # a different crawler
     python crawler_agent.py --count 5 --quiet        # one line per fetch
+    python crawler_agent.py --legacy-hmac            # the old shared-secret proof
 """
 
 from __future__ import annotations
@@ -37,8 +45,16 @@ import os
 import random
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,7 +62,20 @@ load_dotenv()
 DEFAULT_RESOURCE = os.getenv("RESOURCE_URL", "http://localhost:3402/premium/market-report")
 DEFAULT_FACILITATOR = os.getenv("FACILITATOR_URL", "http://localhost:8402")
 DEFAULT_AGENT_ID = os.getenv("AGENT_ID", "agent-perplexity-bot")
+
+# Only used by --legacy-hmac, which exists to demonstrate the pre-keypair
+# proof the facilitator still accepts from unregistered agents. The normal
+# path never touches this.
 HMAC_SECRET = os.getenv("X402_HMAC_SECRET", "dev-only-shared-secret-change-me")
+
+# Where this agent keeps its private key. One file per agent id, so
+# `--count 8` spreading traffic over several crawler identities gives each a
+# genuinely distinct key rather than one key wearing several names.
+#
+# Gitignored, and that is not a formality: the whole value of the keypair is
+# that this file exists in exactly one place. A private key committed to a
+# repository is a shared secret with extra steps.
+KEY_DIR = Path(os.getenv("AGENT_KEY_DIR", Path(__file__).resolve().parent / ".keys"))
 
 # Crawler identities used by --count when no --agent-id is given, so a simulated
 # day of traffic looks like several different bots rather than one very
@@ -128,6 +157,62 @@ def paise_to_rupees(paise: int | str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The agent's signing key
+# ---------------------------------------------------------------------------
+
+
+def load_or_create_key(agent_id: str) -> tuple[str, str]:
+    """Loads this agent's Ed25519 keypair, generating one on first run.
+
+    Persisted rather than regenerated per process, because the identity has
+    to outlive the run: the facilitator binds `agent_id` to the first key it
+    sees (trust-on-first-use), so an agent that generated a fresh key every
+    time would be refused the second time it registered.
+
+    Args:
+        agent_id: Identity the key belongs to.
+
+    Returns:
+        `(private_key_b64, public_key_b64)`.
+    """
+    KEY_DIR.mkdir(parents=True, exist_ok=True)
+    key_path = KEY_DIR / f"{agent_id}.key"
+
+    if key_path.exists():
+        private = Ed25519PrivateKey.from_private_bytes(
+            base64.b64decode(key_path.read_text().strip())
+        )
+    else:
+        private = Ed25519PrivateKey.generate()
+        raw = private.private_bytes(
+            encoding=Encoding.Raw,
+            format=PrivateFormat.Raw,
+            encryption_algorithm=NoEncryption(),
+        )
+        key_path.write_text(base64.b64encode(raw).decode("ascii"))
+        # Owner-only where the filesystem honours it. A no-op on Windows,
+        # which is why it is not the only thing keeping the key private —
+        # the directory is gitignored regardless.
+        try:
+            key_path.chmod(0o600)
+        except OSError:  # pragma: no cover - platform dependent
+            pass
+
+    private_b64 = base64.b64encode(
+        private.private_bytes(
+            encoding=Encoding.Raw,
+            format=PrivateFormat.Raw,
+            encryption_algorithm=NoEncryption(),
+        )
+    ).decode("ascii")
+    public_b64 = base64.b64encode(
+        private.public_key().public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+    ).decode("ascii")
+
+    return private_b64, public_b64
+
+
+# ---------------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------------
 
@@ -144,8 +229,10 @@ class X402Agent:
         resource_url: The paywalled resource to fetch.
         facilitator_url: Where to get quoted. Discovered from the 402 when the
             publisher advertises it, so this is only a fallback.
-        secret: Shared HMAC secret. In production this would be the agent's own
-            private key, and the facilitator would hold only the public half.
+        secret: Shared HMAC secret, used only under `legacy_hmac`.
+        legacy_hmac: Sign with the old shared secret instead of this agent's
+            keypair. Kept so the downgrade path the facilitator still accepts
+            from unregistered agents can actually be exercised and seen.
         verbose: Narrate every step.
     """
 
@@ -156,14 +243,25 @@ class X402Agent:
         resource_url: str = DEFAULT_RESOURCE,
         facilitator_url: str = DEFAULT_FACILITATOR,
         secret: str = HMAC_SECRET,
+        legacy_hmac: bool = False,
         verbose: bool = True,
     ) -> None:
         self.agent_id = agent_id
         self.resource_url = resource_url
         self.facilitator_url = facilitator_url.rstrip("/")
         self.secret = secret
+        self.legacy_hmac = legacy_hmac
         self.verbose = verbose
         self.client = httpx.Client(timeout=30.0)
+        self.registered = False
+
+        # The private half stays in this process and this process only. The
+        # facilitator never sees it, which is the entire difference between
+        # this and the shared-secret scheme it replaced.
+        if legacy_hmac:
+            self.private_key = self.public_key = None
+        else:
+            self.private_key, self.public_key = load_or_create_key(agent_id)
 
     # -- helpers -----------------------------------------------------------
 
@@ -177,16 +275,71 @@ class X402Agent:
         self.say(f"\n{bold(f'[{number}/{total}]')} {bold(title)}")
 
     def sign(self, body: dict) -> str:
-        """HMAC-SHA256 over canonical JSON.
+        """Signs the canonical JSON of `body` with this agent's private key.
 
         Canonical means sorted keys and no incidental whitespace. Both sides
         must build the identical string or the signature will not match — this
         is the single most common way a signature scheme goes wrong, which is
         why the facilitator hands back a `commitmentTemplate` rather than
         making clients guess.
+
+        Ed25519 by default. Under `--legacy-hmac` this falls back to the old
+        shared-secret MAC, which the facilitator still accepts from agents
+        that have not registered a key.
         """
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
-        return hmac.new(self.secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+        if self.legacy_hmac:
+            return hmac.new(self.secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+        private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(self.private_key))
+        return base64.b64encode(private.sign(canonical.encode())).decode("ascii")
+
+    def register(self) -> None:
+        """Announces this agent's public key to the facilitator, once.
+
+        Idempotent server-side, so re-running the agent is not an error. Not
+        counted as one of the five negotiation steps because it is not part
+        of a fetch — an agent registers once in its life and then pays
+        forever, the same way a wallet address is not re-derived per
+        transaction.
+        """
+        if self.legacy_hmac or self.registered:
+            return
+
+        response = self.client.post(
+            f"{self.facilitator_url}/agents/register",
+            json={
+                "agentId": self.agent_id,
+                "publicKey": self.public_key,
+                "algorithm": "ed25519",
+            },
+        )
+
+        if response.status_code == 409:
+            # This id is bound to a different key — almost always a stale or
+            # deleted local key file against a facilitator that still
+            # remembers the old one. Say so plainly rather than failing later
+            # with a confusing invalid_signature at settlement time.
+            raise PaymentRefused(
+                f"{self.agent_id} is registered with a different public key. "
+                f"Delete {KEY_DIR / f'{self.agent_id}.key'} to start over with a fresh "
+                "identity, or use --agent-id to pick a different one."
+            )
+        if response.status_code != 200:
+            raise PaymentRefused(f"key registration failed: {response.text[:300]}")
+
+        self.registered = True
+        body = response.json()
+
+        self.say()
+        self.say(dim(f"  key   {self.agent_id}"))
+        self.say(
+            dim(f"        public  {self.public_key[:24]}…  "
+                f"({'registered now' if body.get('created') else 'already on file'})")
+        )
+        self.say(dim("        private key never leaves this process — the facilitator"))
+        self.say(dim("        holds only the public half and cannot forge a commitment."))
 
     # -- the negotiation ---------------------------------------------------
 
@@ -309,12 +462,22 @@ class X402Agent:
 
         signature = self.sign(commitment)
 
-        self.say(dim("      HMAC-SHA256 over the canonical JSON of:"))
+        algorithm = "HMAC-SHA256" if self.legacy_hmac else "Ed25519"
+        self.say(dim(f"      {algorithm} over the canonical JSON of:"))
         preview = json.dumps(commitment, sort_keys=True, separators=(",", ":"))
         self.say(dim(f"        {preview[:88]}…" if len(preview) > 88 else f"        {preview}"))
-        self.say(f"      {ARROW} {green(signature[:32])}{dim('…')}  {dim('(64 hex chars)')}")
-        self.say(dim("      Demo simplification: HMAC with a secret shared with the"))
-        self.say(dim("      facilitator. Production would use a per-agent keypair."))
+        length = dim(f"({len(signature)} chars)")
+        self.say(f"      {ARROW} {green(signature[:32])}{dim('…')}  {length}")
+
+        if self.legacy_hmac:
+            self.say(yellow("      Legacy path: signed with the secret the facilitator also"))
+            self.say(yellow("      holds, so it could have produced this itself. Accepted"))
+            self.say(yellow("      only from agents with no registered key — an agent that"))
+            self.say(yellow("      has one is refused, because a downgrade would undo it."))
+        else:
+            self.say(dim("      Signed with this agent's own private key. The facilitator"))
+            self.say(dim("      can verify this and cannot produce it — so the commitment"))
+            self.say(dim("      is evidence in a dispute, not just a checksum."))
 
         return {
             "offerId": quote["offer"]["offerId"],
@@ -397,6 +560,9 @@ class X402Agent:
             print(f"  {bold('Bharat x402')} {dim('|')} AI crawler agent")
             print(f"  {self.agent_id} {dim(ARROW)} {self.resource_url}")
             print(rule(HEAVY))
+
+        # One-time identity setup, not part of the negotiation.
+        self.register()
 
         required = self.request_unpaid()
         requirements = required["accepts"][0]
@@ -507,6 +673,15 @@ def main() -> int:
     parser.add_argument(
         "--quiet", action="store_true", help="One line per fetch instead of full narration."
     )
+    parser.add_argument(
+        "--legacy-hmac",
+        action="store_true",
+        help=(
+            "Sign with the old shared secret instead of this agent's keypair. Exercises "
+            "the downgrade path the facilitator still accepts from unregistered agents; "
+            "fails if the facilitator has ALLOW_HMAC_FALLBACK turned off."
+        ),
+    )
     args = parser.parse_args()
 
     verbose = not args.quiet and args.count == 1
@@ -527,6 +702,7 @@ def main() -> int:
             agent_id=agent_id,
             resource_url=args.url,
             facilitator_url=args.facilitator,
+            legacy_hmac=args.legacy_hmac,
             verbose=verbose,
         )
         try:
