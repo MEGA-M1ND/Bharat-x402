@@ -1,0 +1,10 @@
+# The agent's own Ed25519 signing key and the x402 negotiation.
+cryptography==46.0.3
+httpx==0.28.1
+
+# Claude, for researcher.py. Not needed for mcp_server.py or for
+# `researcher.py --scripted`.
+anthropic==1.0.0
+
+# The Model Context Protocol server. Not needed for researcher.py.
+mcp==2.0.0

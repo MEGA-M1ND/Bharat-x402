@@ -27,7 +27,7 @@ ignore = [
 testpaths = ["tests"]
 # Services import their siblings by bare module name (`from ledger import ...`),
 # so the facilitator directory has to be importable from the test process.
-pythonpath = ["facilitator", "demo-agent", "reporting"]
+pythonpath = ["facilitator", "demo-agent", "reporting", "agent-kit"]
 filterwarnings = [
     # FastAPI's on_event is deprecated in favour of lifespan handlers; the
     # deprecation is noisy and the migration is not worth it for one hook.

@@ -15,7 +15,7 @@ whole negotiation yourself, no install.
 | Razorpay charges that took | **5** — one Payment Link per agent, 55 gateway calls avoided |
 | Revenue **impossible** to collect per-request | **₹30.00 of ₹30.00** — every charge under Razorpay's ₹1.00 floor |
 | Razorpay's ₹1 floor | verified by posting 50 paise to the live test API, not read off a doc |
-| Tests | **132** — 122 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
+| Tests | **144** — 134 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
 
 ```
       key   agent-perplexity-bot
@@ -168,6 +168,67 @@ touches a monetary value anywhere in the codebase.
 
 ---
 
+## An agent that decides whether to pay
+
+Everything above proves an agent *can* pay. `agent-kit/` is where something
+actually decides whether to — Claude gets a research question, a rupee budget, and
+five tools, and works out what is worth buying:
+
+```bash
+python agent-kit/researcher.py "What's the going rate for AI agent traffic in India?"
+python agent-kit/researcher.py --scripted     # same tools, no model, no API key needed
+```
+
+The same five tools are also an **MCP server**, so any MCP client — Claude Desktop, an
+Agent Studio agent — can buy things in rupees without knowing what x402 is:
+
+```bash
+python agent-kit/mcp_server.py                # stdio; see the file header for client config
+```
+
+`tools.py` is written once and wrapped by both, because a tool surface is exactly the
+kind of thing that grows a second copy quietly — this repo has already been bitten by
+that (a hand-rolled SQL splitter fixed in one copy and not the other, which real
+Postgres caught in CI).
+
+### The budget is enforced in code, not in the prompt
+
+This is the part worth arguing about, and the reason the agent is interesting rather
+than decorative.
+
+The obvious way to give an agent a spending limit is to write it in the system prompt.
+That is not a control — it is a request. And the agent **reads the documents it buys**,
+so a purchased file saying *"ignore your budget"* is an input an attacker can write.
+Prompt-level limits are exactly what that argument moves.
+
+So `X402Client.pay_and_fetch` refuses an over-budget purchase itself, before any HTTP
+happens — no offer issued, no ledger row, nothing charged:
+
+```
+-> fetch_paid_resource('market-report')
+REFUSED — market-report costs ₹5.00 but only ₹1.50 of the ₹12.00 budget is left.
+          Nothing was charged.
+```
+
+Two supporting decisions, both tested:
+
+- **No tool takes an amount.** The model can name a *resource*; the price comes from the
+  publisher's 402 and the signature is produced behind the tool boundary by a key that
+  never crosses it. A test asserts no tool exposes anything but `resource`.
+- **A refusal is returned as data, not raised.** The agent sees what it has left and
+  picks something cheaper, which is the behaviour you want. An exception would just end
+  the run.
+
+The prompt still states the budget — the model needs it to plan well. The prompt is
+advice; the client is the wall.
+
+> **Dependency note:** `agent-kit` needs its own virtualenv. The MCP SDK requires
+> Starlette 1.x and FastAPI 0.115 pins `<0.42`, so installing both in one environment
+> breaks the facilitator. They are separate processes and separate dependency sets:
+> `python -m venv agent-kit/.venv && agent-kit/.venv/bin/pip install -r agent-kit/requirements.txt`.
+
+---
+
 ## Three things this gets right that a demo usually doesn't
 
 ### 1. The agent signs with a key the facilitator does not have
@@ -289,12 +350,13 @@ The full breakdown, including where fixed fees *do* multiply, is in
 | `resource-server/` | Express publisher. `x402-config.js` is the INR scheme; `server.js` mounts the gate; `public/` is the console UI |
 | `facilitator/` | **The new piece.** `main.py` (x402 contract, `/offer`, `/settle-batch`, `/agents/register`), `payment_verifier.py` (Ed25519 + offer signing), `webhooks.py` (Razorpay callbacks), `ledger.py` (SQLite/Postgres book of record), `razorpay_client.py` (Payment Links + cost model), `db.py` (dialect shim), `scheduler.py` |
 | `demo-agent/` | A crawler that holds its own keypair and narrates the whole negotiation as it pays |
+| `agent-kit/` | **The agent surface.** `x402_client.py` (the negotiation + the budget wall), `tools.py` (the five tools, defined once), `mcp_server.py` (MCP), `researcher.py` (a Claude agent that decides what to buy) |
 | `reporting/` | The publisher's daily revenue digest, formatted as a WhatsApp message |
-| `tests/` | 132 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py` |
+| `tests/` | 144 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall) |
 | `docs/` | [Architecture](docs/architecture.md) · [Demo script](docs/demo-script.md) |
 
 ```bash
-pytest tests -v                                     # 132 tests
+pytest tests -v                                     # 144 tests
 TEST_LEDGER_DSN=postgres://… pytest tests -q        # the same suite, on real Postgres
 ```
 
