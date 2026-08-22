@@ -1,29 +1,58 @@
 """Offer signing and payment-proof verification.
 
 ===========================================================================
-THE SUBSTITUTION THIS FILE MAKES — read before judging the crypto
+TWO SIGNATURES, TWO DIFFERENT JOBS — read before judging the crypto
 ===========================================================================
-Real x402 on EVM proves payment with an EIP-3009 `transferWithAuthorization`
-signature: the agent signs with a private key nobody else holds, and the
-facilitator verifies against the corresponding public address. Only the agent
-can produce that signature, so the proof is non-repudiable.
+There are two signed objects in this protocol and they have opposite trust
+requirements. Using one primitive for both is the mistake this file used to
+make, and the fix is not "HMAC is weak" — HMAC-SHA256 is a perfectly strong
+MAC. The problem is *shape*: a MAC's verifier holds the same key the signer
+does, so anyone who can check a signature can also produce one.
 
-This project substitutes **HMAC-SHA256 with a shared secret**, and that is a
-real downgrade, not a cosmetic one:
+  1. **The offer** (facilitator -> agent, then back again).
+     Signed with HMAC-SHA256 under the facilitator's own secret, and that is
+     the *correct* choice, not a leftover. The facilitator is both the signer
+     and the only party that ever verifies it — the signature exists so the
+     facilitator can detect its own ledger row being edited underneath it.
+     Nobody else needs to check it, so there is nothing for a public key to
+     buy here, and a symmetric MAC is faster and simpler.
 
-  * The facilitator can forge any agent's commitment, because it holds the same
-    key it verifies with. There is no non-repudiation — a publisher and an
-    agent who disagree about a charge cannot be adjudicated from the proof.
-  * Every participant sharing one secret means compromise anywhere is
-    compromise everywhere.
+  2. **The commitment** (agent -> facilitator).
+     This one is evidence in a dispute: it is the agent saying "I agree to
+     owe ₹5 for this fetch". Under a shared secret the facilitator could
+     mint that statement itself, so the proof settles nothing — a publisher
+     and an agent who disagree about a charge cannot be adjudicated from it.
+     Non-repudiation requires that the verifier *cannot* sign, which means
+     asymmetric. Real x402 on EVM gets this from an EIP-3009 signature over
+     the agent's wallet key; the equivalent for an off-chain rupee rail is a
+     plain signing keypair, so this uses **Ed25519**.
 
-It is used here because it keeps the demo to one dependency-free file and
-keeps attention on the settlement economics, which is the actual contribution.
-Production would issue each agent a keypair (Ed25519 is the obvious pick for a
-non-EVM rail) and verify signatures against a registered public key, at which
-point this module changes and nothing else does.
+Ed25519 specifically, over ECDSA or RSA: no parameter choices to get wrong,
+no per-signature nonce to leak a private key when a PRNG misbehaves (which is
+how PlayStation 3 and several Bitcoin wallets lost their keys), deterministic
+signatures, and 32-byte public keys that fit comfortably in a JSON payload.
 
-What the demo *does* get right, and would keep in production:
+THE DOWNGRADE ATTACK, AND WHY THE CLIENT DOES NOT PICK THE ALGORITHM
+--------------------------------------------------------------------
+`verify_payment_proof` decides which primitive to demand by looking up what
+the *facilitator* has on record for that agent — never by reading an
+algorithm field out of the attacker-supplied payload. If an agent has
+registered a key, an Ed25519 signature is required and an HMAC one is
+refused, full stop.
+
+This matters more than it looks. Protocols that let the presenter name their
+own algorithm have been broken exactly this way for a decade: JWT's
+`alg: none` and its HMAC/RSA confusion bug are the canonical case, where a
+token signed with the *public* key as an HMAC secret verified fine. Algorithm
+agility is fine; attacker-chosen algorithm agility is a vulnerability.
+
+The HMAC path survives only for agents with no registered key, and only while
+`ALLOW_HMAC_FALLBACK` is on — the migration ramp, so existing clients keep
+working while they roll keys out. Turning it off makes registration
+mandatory. Every fallback verification is logged as a downgrade so the ramp
+is visible rather than permanent-by-accident.
+
+What was already right here, and is unchanged:
 
   * Constant-time comparison, so signature checking cannot be timed.
   * Canonical serialisation, so the same logical offer always signs the same
@@ -34,13 +63,22 @@ What the demo *does* get right, and would keep in production:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import secrets
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 
 class VerificationError(Exception):
@@ -104,6 +142,125 @@ def verify_signature(payload: dict, signature: str, secret: str) -> bool:
         Whether the signature is valid.
     """
     return hmac.compare_digest(sign(payload, secret), signature or "")
+
+
+# ---------------------------------------------------------------------------
+# Ed25519 — the agent's own key
+# ---------------------------------------------------------------------------
+#
+# Keys and signatures travel as base64 of their raw bytes: 32 bytes of public
+# key (44 base64 chars), 64 bytes of signature (88 chars). Raw rather than
+# PEM or DER because there is exactly one key type here and no algorithm
+# identifier to negotiate — see the module docstring on why letting the
+# payload name its own algorithm is a vulnerability rather than a feature.
+
+ALGORITHM = "ed25519"
+
+
+class KeyFormatError(Exception):
+    """A key or signature was not decodable as base64 Ed25519 material."""
+
+
+def generate_keypair() -> tuple[str, str]:
+    """Creates a fresh Ed25519 keypair.
+
+    Returns:
+        `(private_key_b64, public_key_b64)`, both base64 of raw bytes. The
+        private half never leaves the agent that generated it; only the
+        public half is registered with the facilitator.
+    """
+    private = Ed25519PrivateKey.generate()
+    return private_key_to_b64(private), public_key_b64_for(private)
+
+
+def private_key_to_b64(private: Ed25519PrivateKey) -> str:
+    """Serialises a private key to base64 of its raw 32 bytes."""
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+    )
+
+    raw = private.private_bytes(
+        encoding=Encoding.Raw, format=PrivateFormat.Raw, encryption_algorithm=NoEncryption()
+    )
+    return base64.b64encode(raw).decode("ascii")
+
+
+def public_key_b64_for(private: Ed25519PrivateKey) -> str:
+    """The base64 public half of a private key."""
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+    raw = private.public_key().public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+    return base64.b64encode(raw).decode("ascii")
+
+
+def load_private_key(private_key_b64: str) -> Ed25519PrivateKey:
+    """Parses a base64 raw private key.
+
+    Raises:
+        KeyFormatError: If it is not 32 decodable bytes.
+    """
+    try:
+        raw = base64.b64decode(private_key_b64, validate=True)
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    except Exception as exc:  # noqa: BLE001 - every failure means the same thing to the caller
+        raise KeyFormatError("Private key must be base64 of 32 raw Ed25519 bytes.") from exc
+
+
+def load_public_key(public_key_b64: str) -> Ed25519PublicKey:
+    """Parses a base64 raw public key.
+
+    Raises:
+        KeyFormatError: If it is not 32 decodable bytes.
+    """
+    try:
+        return Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key_b64, validate=True))
+    except Exception as exc:  # noqa: BLE001 - every failure means the same thing to the caller
+        raise KeyFormatError("Public key must be base64 of 32 raw Ed25519 bytes.") from exc
+
+
+def sign_ed25519(payload: dict, private_key_b64: str) -> str:
+    """Signs the canonical form of `payload` with an agent's private key.
+
+    Args:
+        payload: What to sign.
+        private_key_b64: Base64 raw Ed25519 private key.
+
+    Returns:
+        Base64 of the 64-byte signature.
+    """
+    private = load_private_key(private_key_b64)
+    signature = private.sign(canonical_json(payload).encode("utf-8"))
+    return base64.b64encode(signature).decode("ascii")
+
+
+def verify_ed25519(payload: dict, signature_b64: str, public_key_b64: str) -> bool:
+    """Checks an Ed25519 signature over the canonical form of `payload`.
+
+    No constant-time note needed here, unlike the HMAC path: verification is
+    a public-key operation over public data, and there is no secret in this
+    function for a timing side channel to leak.
+
+    Args:
+        payload: The signed object.
+        signature_b64: Base64 signature to check.
+        public_key_b64: The agent's registered base64 public key.
+
+    Returns:
+        Whether the signature is valid. A malformed key or signature is a
+        failed verification, not an exception — a caller checking a proof
+        wants a yes/no, and "unparseable" is a no.
+    """
+    try:
+        public = load_public_key(public_key_b64)
+        public.verify(
+            base64.b64decode(signature_b64 or "", validate=True),
+            canonical_json(payload).encode("utf-8"),
+        )
+    except (InvalidSignature, KeyFormatError, ValueError, TypeError):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +394,8 @@ def verify_payment_proof(
     offer_row: dict | None,
     requirements: dict,
     secret: str,
+    agent_key: Mapping[str, Any] | None = None,
+    allow_hmac_fallback: bool = True,
     now: datetime | None = None,
 ) -> dict:
     """Checks an agent's payment proof against the offer it claims to satisfy.
@@ -250,11 +409,22 @@ def verify_payment_proof(
         requirements: The x402 `paymentRequirements` the resource server is
             enforcing. Checked against the offer so an agent cannot present a
             valid ₹1 offer to satisfy a ₹500 requirement.
-        secret: Shared HMAC secret.
+        secret: The facilitator's own HMAC secret. Always used to check the
+            stored offer's integrity; used for the *agent's* signature only on
+            the fallback path below.
+        agent_key: The agent's registered key row, or None if it has never
+            registered. When present, an Ed25519 signature is required and an
+            HMAC one is refused — the decision is made from this argument, not
+            from anything in `payload`.
+        allow_hmac_fallback: Whether an unregistered agent may still pay with
+            a shared-secret HMAC signature. The migration ramp; turning it off
+            makes key registration mandatory.
         now: Injectable clock, for tests.
 
     Returns:
-        `{"offerId": ..., "agentId": ..., "amountPaise": ...}` on success.
+        `{"offerId": ..., "agentId": ..., "amountPaise": ..., "proofScheme": ...}`
+        on success. `proofScheme` reports which primitive actually verified,
+        so the caller can log a fallback as the downgrade it is.
 
     Raises:
         VerificationError: With a reason code, on any failure.
@@ -311,12 +481,42 @@ def verify_payment_proof(
         )
 
     expected = agent_commitment_body(offer, accepted_at)
-    if not verify_signature(expected, agent_signature, secret):
-        raise VerificationError(
-            "invalid_signature",
-            "Agent signature does not match the offer it claims to accept. "
-            "Either the payload was altered in transit or it was signed with the wrong key.",
-        )
+
+    # Which primitive is demanded is decided *here*, from what the facilitator
+    # holds on record — never from an algorithm field in the agent-supplied
+    # payload. An attacker who can pick the algorithm picks the weakest one.
+    if agent_key is not None:
+        if agent_key["algorithm"] != ALGORITHM:
+            raise VerificationError(
+                "unsupported_algorithm",
+                f"Agent {offer['agentId']} is registered with unsupported algorithm "
+                f"{agent_key['algorithm']!r}; this facilitator verifies {ALGORITHM}.",
+            )
+        if not verify_ed25519(expected, agent_signature, agent_key["public_key"]):
+            raise VerificationError(
+                "invalid_signature",
+                "Agent signature does not match the offer it claims to accept. "
+                "Either the payload was altered in transit or it was not signed by "
+                "the key registered to this agent.",
+            )
+        proof_scheme = ALGORITHM
+    else:
+        # No registered key. Either accept the legacy shared-secret proof, or
+        # refuse outright once the migration is finished.
+        if not allow_hmac_fallback:
+            raise VerificationError(
+                "agent_not_registered",
+                f"Agent {offer['agentId']} has no registered signing key. Register an "
+                "Ed25519 public key with POST /agents/register before paying.",
+            )
+        if not verify_signature(expected, agent_signature, secret):
+            raise VerificationError(
+                "invalid_signature",
+                "Agent signature does not match the offer it claims to accept. "
+                "Either the payload was altered in transit or it was signed with "
+                "the wrong key.",
+            )
+        proof_scheme = "hmac-sha256"
 
     # An offer for ₹1 must not satisfy a requirement for ₹5. Checked explicitly
     # because the resource server and the facilitator are separate services and
@@ -361,4 +561,5 @@ def verify_payment_proof(
         "amountPaise": int(offer["amountPaise"]),
         "asset": offer["asset"],
         "offerStatus": offer_row["status"],
+        "proofScheme": proof_scheme,
     }

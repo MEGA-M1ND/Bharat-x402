@@ -7,11 +7,16 @@ browser can render the same five steps without a terminal in the loop.
 ---------------------------------------------------------------------------
 WHY THIS LIVES HERE, AND WHY IT CANNOT LIVE IN THE BROWSER
 ---------------------------------------------------------------------------
-Step 3 of the negotiation — signing acceptance of a quote — needs the shared
-HMAC secret. Doing that in page JavaScript would ship the secret to every
+Step 3 of the negotiation — signing acceptance of a quote — needs a private
+key. Doing that in page JavaScript would ship signing material to every
 visitor's browser, which is a materially worse mistake than any of the other
-simplifications this project makes elsewhere. So this endpoint holds the
-secret and does the signing; the browser only ever sees the result.
+simplifications this project makes elsewhere. So this endpoint does the
+signing; the browser only ever sees the result.
+
+The console's agent therefore has its key held by the facilitator itself,
+which does cost the non-repudiation property the keypair otherwise buys —
+see `_console_agent_key` for why that is unavoidable here and where the
+honest demonstration lives instead.
 
 Steps 1 and 4 are genuine cross-service HTTP calls to the resource server —
 the same requests `crawler_agent.py` makes — so the 402 and the settlement
@@ -29,6 +34,8 @@ and for any other x402 client. Nothing about the protocol path is faked.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import re
 import time
@@ -36,8 +43,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import APIRouter, HTTPException
-from payment_verifier import VerificationError, agent_commitment_body, build_offer, sign
+from payment_verifier import (
+    ALGORITHM,
+    VerificationError,
+    agent_commitment_body,
+    build_offer,
+    public_key_b64_for,
+    sign,
+    sign_ed25519,
+)
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/demo", tags=["demo"])
@@ -72,6 +88,65 @@ def configure(
         offer_policy=offer_policy,
         resource_url=resource_url.rstrip("/"),
     )
+
+
+def _console_agent_key(agent_id: str) -> tuple[str, str]:
+    """Derives the simulated console agent's Ed25519 keypair, deterministically.
+
+    Be clear about what this is and is not. The console's agent runs
+    *inside* the facilitator, so the facilitator unavoidably holds its
+    private key — a browser cannot be handed one safely, which is the whole
+    reason step 3 happens server-side. For this one simulated agent the
+    non-repudiation argument therefore does not apply. `demo-agent/
+    crawler_agent.py` is the honest demonstration: a separate process that
+    generates its own key and gives the facilitator only the public half.
+
+    What this does buy is that the console exercises the *real* Ed25519 code
+    path end to end — registration, signing, verification against a stored
+    public key — rather than a parallel shortcut that could rot.
+
+    Derived rather than generated because the deployment is serverless: a
+    randomly generated key would be lost on every cold start, and the next
+    request would try to re-register the same `agent_id` with a different
+    key and be refused. Deriving it from the facilitator's own secret means
+    the same agent id always yields the same key, in any process, with
+    nothing to persist.
+
+    Args:
+        agent_id: The console-derived agent identity.
+
+    Returns:
+        `(private_key_b64, public_key_b64)`.
+    """
+    # HMAC as a PRF: 32 bytes out, which is exactly an Ed25519 seed.
+    seed = hmac.new(
+        _ctx["hmac_secret"].encode("utf-8"),
+        f"console-agent:{agent_id}".encode(),
+        hashlib.sha256,
+    ).digest()
+    private = Ed25519PrivateKey.from_private_bytes(seed)
+    return base64.b64encode(seed).decode("ascii"), public_key_b64_for(private)
+
+
+def _ensure_registered(agent_id: str) -> str:
+    """Registers the simulated agent's public key if it is not already on file.
+
+    Returns:
+        The agent's base64 public key.
+    """
+    private_b64, public_b64 = _console_agent_key(agent_id)
+    try:
+        _ctx["ledger"].register_agent(
+            agent_id=agent_id, public_key=public_b64, algorithm=ALGORITHM
+        )
+    except ValueError:
+        # Already bound to a different key — only reachable if the
+        # facilitator's HMAC secret changed after this agent id first
+        # registered, since the key is derived from it. Left to fail loudly
+        # at verification rather than silently rebinding, which is exactly
+        # the takeover the registration guard exists to prevent.
+        pass
+    return private_b64
 
 
 # Mirrors the paths registered in resource-server/x402-config.js. The two
@@ -182,6 +257,9 @@ def run_demo(request: DemoRunRequest) -> dict:
     path = RESOURCE_PATHS.get(request.resource, RESOURCE_PATHS["market-report"])
     url = f"{_ctx['resource_url']}{path}"
 
+    # One-time per identity, and cheap when it has already happened.
+    agent_private_key = _ensure_registered(agent_id)
+
     started = time.monotonic()
     steps: list[dict] = []
 
@@ -286,12 +364,14 @@ def run_demo(request: DemoRunRequest) -> dict:
         accepted_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         commitment = dict(commitment_template)
         commitment["acceptedAt"] = accepted_at
-        agent_signature = sign(commitment, _ctx["hmac_secret"])
+        agent_signature = sign_ed25519(commitment, agent_private_key)
 
         if request.tamper:
-            # Flip one hex character. Still a well-formed 64-char signature —
-            # the point is to fail verification, not to fail parsing.
-            flipped = "1" if agent_signature[0] == "0" else "0"
+            # Flip one base64 character, staying inside the alphabet so the
+            # result still decodes to 64 bytes. The point is to fail the
+            # signature check, not to fail parsing — a forgery that gets
+            # rejected as malformed proves nothing about the crypto.
+            flipped = "B" if agent_signature[0] == "A" else "A"
             agent_signature = flipped + agent_signature[1:]
 
         canonical = json.dumps(commitment, sort_keys=True, separators=(",", ":"))
@@ -303,13 +383,17 @@ def run_demo(request: DemoRunRequest) -> dict:
                 "decoded": {
                     "canonicalJson": canonical,
                     "signature": agent_signature,
-                    "algorithm": "HMAC-SHA256",
+                    "algorithm": "Ed25519",
+                    "agentPublicKey": _console_agent_key(agent_id)[1],
                     "tampered": request.tamper,
                 },
                 "note": (
-                    "Signed server-side — the shared secret never reaches your browser. "
-                    "Demo simplification: HMAC with a secret shared with the facilitator. "
-                    "Production would use a per-agent keypair."
+                    "Ed25519, signed with this agent's own key — no signing material "
+                    "ever reaches your browser. The facilitator holds only the public "
+                    "half and cannot produce this signature. Caveat specific to the "
+                    "console: because the simulated agent runs inside the facilitator, "
+                    "this one key is necessarily known to it. Run demo-agent/"
+                    "crawler_agent.py for the separated-process version."
                 ),
             }
         )

@@ -779,8 +779,40 @@ code,
     color: #a5b4fc;
   }
 
-  .econ-quote,
   .econ-row {
     color: #c7d2fe;
+  }
+
+  /* .econ-quote keeps its own translucent-*white* overlay in both themes
+     (see its own rule above), sitting on top of the dark card behind it —
+     unlike .econ-row, which sits directly on that dark card and reads fine
+     in the light lavender used for the rest of this block. Pin its text back
+     to something dark enough to read against that lighter overlay. */
+  .econ-quote {
+    color: #3730a3;
+  }
+
+  /* .result keeps a light "unlocked paper" background in both themes (see
+     its own rule above) — deliberately not a --surface card. Its text uses
+     var(--text)/var(--text-muted), which is right in light mode and flips to
+     near-white in dark mode, so on this one always-light card it renders
+     as near-invisible light-on-light. Pin it back to dark, readable text. */
+  .result:not(.result--error) {
+    color: #101828;
+  }
+
+  .result:not(.result--error) .result__meta,
+  .result:not(.result--error) .result__findings {
+    color: #667085;
+  }
+
+  /* Same issue, same fix: .stat-tile also keeps a light background in both
+     themes, so its var(--text)/var(--text-muted) content needs pinning too. */
+  .stat-tile {
+    color: #101828;
+  }
+
+  .stat-tile__label {
+    color: #667085;
   }
 }

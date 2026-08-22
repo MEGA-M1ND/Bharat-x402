@@ -7,12 +7,14 @@ question a publisher will actually ask — *which agent owes me what, and did it
 get paid?* — so it is deliberately the most boring, most explicit code in the
 project.
 
-Four tables:
+Six tables:
 
-    offers       a quoted price, signed and time-limited
-    batches      one real Razorpay charge covering many commitments
-    commitments  an agent's accepted offer — a debt, not yet money
-    events       append-only log of everything that happened
+    agents         an agent's registered Ed25519 public key
+    offers         a quoted price, signed and time-limited
+    batches        one real Razorpay charge covering many commitments
+    commitments    an agent's accepted offer — a debt, not yet money
+    events         append-only log of everything that happened
+    webhook_events Razorpay callbacks we have already processed
 
 (`batches` is declared before `commitments` because `commitments.batch_id`
 references it — SQLite resolves foreign keys lazily and does not care about
@@ -23,6 +25,24 @@ The offer -> commitment -> batch progression is the whole idea. A ₹5 API call
 becomes a commitment instantly (cheap, no gateway involved), and rupees move
 later when many commitments are charged together.
 
+COMMITTED IS NOT COLLECTED
+--------------------------
+Two different questions live in this schema and it is worth being precise
+about which column answers which, because conflating them is how a payments
+ledger ends up overstating revenue:
+
+  * `commitments.status = 'settled'` means *this debt has been assigned to a
+    batch*. It is no longer separately chargeable and will not be
+    double-billed. It does **not** mean anyone has paid.
+  * `batches.status = 'paid'` means Razorpay told us — over a signed webhook
+    (see webhooks.py) — that money actually arrived.
+
+A Payment Link that was created is an invoice, not a receipt. Until the
+webhook lands, the honest description of a batch is "billed, awaiting
+payment", which is why `daily_summary` reports `committedPaise` and
+`collectedPaise` as separate figures rather than one number labelled
+"revenue".
+
 Money is stored as INTEGER paise throughout. Never floats — a float would
 silently lose precision on rupee arithmetic and there is no reason to risk it.
 """
@@ -31,6 +51,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 from collections.abc import Iterator, Mapping
@@ -49,6 +70,28 @@ import db
 _WRITE_LOCK = threading.Lock()
 
 DEFAULT_DB_PATH = os.getenv("LEDGER_DB_PATH", "./data/ledger.db")
+
+
+# Matches the `user:password@` portion of any connection URL. Database driver
+# errors quote the DSN they failed on more often than you would like — psycopg
+# does it on several connection failures — so any driver message that escapes
+# this module has to be scrubbed first, not merely assumed to be clean.
+_DSN_CREDENTIALS_RE = re.compile(r"://[^\s/@]+:[^\s/@]+@")
+
+
+def redact_credentials(text: str) -> str:
+    """Strips `user:password@` out of any connection URL in `text`.
+
+    Keeps the scheme and host, which are what make an error diagnosable, and
+    drops the part that must never reach a log line or an HTTP response.
+
+    Args:
+        text: Arbitrary message text, typically a driver exception.
+
+    Returns:
+        The same text with credentials replaced.
+    """
+    return _DSN_CREDENTIALS_RE.sub("://<redacted>@", text)
 
 
 def utc_now() -> str:
@@ -85,6 +128,18 @@ def schema_sql(dialect: str) -> str:
         dialect: "sqlite" or "postgres".
     """
     return f"""
+-- One row per agent that has registered a signing key. Holds only the
+-- *public* half: the facilitator can verify an agent's commitments and can
+-- never produce one, which is the entire point of moving off a shared HMAC
+-- secret (see payment_verifier.py).
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id      TEXT PRIMARY KEY,
+    -- base64 of the raw 32-byte Ed25519 public key.
+    public_key    TEXT NOT NULL,
+    algorithm     TEXT NOT NULL,
+    registered_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id      TEXT PRIMARY KEY,
     agent_id      TEXT NOT NULL,
@@ -113,10 +168,18 @@ CREATE TABLE IF NOT EXISTS batches (
     -- What Razorpay gave us back. Null in dry-run.
     payment_link_id     TEXT,
     payment_link_url    TEXT,
-    -- created | failed | dry_run
+    -- created | paid | expired | cancelled | failed | dry_run
+    --
+    -- `created` means an invoice exists, NOT that money arrived. Only the
+    -- signed Razorpay webhook moves a batch to `paid` (see webhooks.py).
     status              TEXT NOT NULL,
     razorpay_mode       TEXT NOT NULL,
-    error_message       TEXT
+    error_message       TEXT,
+    -- Filled in by the webhook, not by the settlement run that created the
+    -- link. Null until Razorpay confirms payment.
+    paid_at             TEXT,
+    amount_paid_paise   INTEGER,
+    razorpay_payment_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS commitments (
@@ -153,9 +216,27 @@ CREATE TABLE IF NOT EXISTS events (
     detail       TEXT
 );
 
+-- Razorpay retries a webhook until it gets a 2xx, so the same event will
+-- arrive more than once as a matter of course — not as an edge case. The
+-- primary key is the dedupe guard: processing claims the key with an INSERT
+-- first, and a duplicate delivery loses that INSERT and returns early
+-- without touching a batch. Same discipline as `commitments.offer_id`:
+-- exactly-once is enforced by a database constraint, not by application
+-- logic remembering to check.
+CREATE TABLE IF NOT EXISTS webhook_events (
+    dedupe_key      TEXT PRIMARY KEY,
+    event           TEXT NOT NULL,
+    received_at     TEXT NOT NULL,
+    payment_link_id TEXT,
+    -- claimed | applied | ignored | unknown_link
+    outcome         TEXT NOT NULL,
+    detail          TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_commitments_settlement
     ON commitments (status, agent_id, settle_date);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+CREATE INDEX IF NOT EXISTS idx_batches_payment_link ON batches (payment_link_id);
 """
 
 
@@ -250,6 +331,115 @@ class Ledger:
             **detail,
         }
         print(json.dumps(line, sort_keys=True, default=str), file=sys.stdout, flush=True)
+
+    def check_connection(self) -> tuple[bool, str]:
+        """Whether the ledger is reachable right now.
+
+        `SELECT 1` — a round trip that touches no table, so it reports on the
+        connection rather than on whether a migration has been applied.
+
+        Never raises. A health check that throws is a health check that turns
+        one outage into two, and the caller wants a status to report rather
+        than an exception to handle.
+
+        Returns:
+            `(ok, detail)` — detail names the failure when ok is False, with
+            connection-string credentials scrubbed. Drivers quote the DSN they
+            failed on, and this string is returned over HTTP by `/health`.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute("SELECT 1")
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never raised
+            return False, redact_credentials(f"{type(exc).__name__}: {str(exc)[:200]}")
+        return True, "connected"
+
+    # -- agent keys --------------------------------------------------------
+
+    def register_agent(self, *, agent_id: str, public_key: str, algorithm: str) -> dict:
+        """Records an agent's public signing key, first-registration-wins.
+
+        Trust-on-first-use, and worth being explicit that this is a real
+        limitation rather than a rounding error: the first caller to claim an
+        agent id owns it, because there is nothing else here to bind that id
+        to. A production facilitator would issue the key at onboarding
+        alongside the merchant account it settles into, so the key is
+        vouched-for rather than merely first.
+
+        What TOFU *does* buy, and the reason it is worth having over a shared
+        secret even so: once an id is claimed, no one else can spend as it,
+        and the facilitator itself cannot forge its commitments either. The
+        rebinding attempt is refused rather than silently overwriting, which
+        is what stops key rotation from doubling as account takeover.
+
+        Args:
+            agent_id: Identity being registered.
+            public_key: Base64 of the raw Ed25519 public key.
+            algorithm: Signature algorithm, currently always "ed25519".
+
+        Returns:
+            `{"agentId", "publicKey", "algorithm", "registeredAt", "created"}`.
+            `created` is False when this was an idempotent re-registration of
+            the identical key.
+
+        Raises:
+            ValueError: If the id is already bound to a *different* key.
+        """
+        registered_at = utc_now()
+
+        with _WRITE_LOCK, self._connect() as conn:
+            # `ON CONFLICT DO NOTHING` rather than catching a unique violation,
+            # for a dialect reason worth stating because SQLite hides it
+            # completely: in Postgres a failed statement aborts the entire
+            # transaction, and every subsequent command on that connection
+            # fails with InFailedSqlTransaction until it is rolled back. So the
+            # obvious try/except INSERT, then SELECT to see what is already
+            # there cannot work — the recovery read is itself refused. SQLite
+            # has no such rule and passes it happily, which is exactly why the
+            # suite runs against both engines.
+            #
+            # This is also simply better: one statement does the claim, so
+            # there is no read-then-write gap, the same reasoning as
+            # `create_commitment` below.
+            inserted = conn.execute(
+                "INSERT INTO agents (agent_id, public_key, algorithm, registered_at)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT (agent_id) DO NOTHING",
+                (agent_id, public_key, algorithm, registered_at),
+            )
+
+            if inserted.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
+                ).fetchone()
+                # Re-registering the same key is a no-op, so an agent that
+                # restarts and re-announces itself does not need to care
+                # whether it has registered before.
+                if existing is not None and existing["public_key"] == public_key:
+                    return {
+                        "agentId": agent_id,
+                        "publicKey": existing["public_key"],
+                        "algorithm": existing["algorithm"],
+                        "registeredAt": existing["registered_at"],
+                        "created": False,
+                    }
+                raise ValueError(
+                    f"agent {agent_id} is already registered with a different public key"
+                )
+
+        return {
+            "agentId": agent_id,
+            "publicKey": public_key,
+            "algorithm": algorithm,
+            "registeredAt": registered_at,
+            "created": True,
+        }
+
+    def get_agent(self, agent_id: str) -> Mapping[str, Any] | None:
+        """Looks up an agent's registered key, or None if it has never registered."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
 
     # -- offers ------------------------------------------------------------
 
@@ -494,6 +684,148 @@ class Ledger:
                 "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
             ).fetchone()
 
+    def get_batch_by_link(self, payment_link_id: str) -> Mapping[str, Any] | None:
+        """Finds the batch a Razorpay Payment Link belongs to.
+
+        The lookup a webhook needs: Razorpay tells us about a `plink_...`, and
+        we have to map it back to the commitments it covers.
+        """
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM batches WHERE payment_link_id = ?", (payment_link_id,)
+            ).fetchone()
+
+    # -- webhooks ----------------------------------------------------------
+
+    def claim_webhook(
+        self, *, dedupe_key: str, event: str, payment_link_id: str | None
+    ) -> bool:
+        """Claims a webhook delivery for processing, exactly once.
+
+        Razorpay retries until it gets a 2xx, so redelivery is routine rather
+        than exceptional — and a redelivered `payment_link.paid` that gets
+        applied twice would double-count collected revenue. The guard is a
+        primary-key INSERT rather than a "have we seen this?" SELECT: two
+        concurrent deliveries of the same event both pass a SELECT check, and
+        only one can win an INSERT.
+
+        Args:
+            dedupe_key: Stable identifier for this delivery.
+            event: Razorpay event name.
+            payment_link_id: The link this concerns, when there is one.
+
+        Returns:
+            True if this caller now owns the delivery, False if it was already
+            processed and should be acknowledged without further action.
+        """
+        with _WRITE_LOCK, self._connect() as conn:
+            # Same `ON CONFLICT DO NOTHING` as `register_agent`, and for the
+            # same reason: a caught unique violation leaves a Postgres
+            # transaction aborted, so nothing else can run on that connection
+            # afterwards. Nothing does here *today*, which is the trap — the
+            # next person to add a statement below this line would find it
+            # failing for a reason that has nothing to do with what they wrote.
+            claimed = conn.execute(
+                "INSERT INTO webhook_events"
+                " (dedupe_key, event, received_at, payment_link_id, outcome)"
+                " VALUES (?, ?, ?, ?, 'claimed') ON CONFLICT (dedupe_key) DO NOTHING",
+                (dedupe_key, event, utc_now(), payment_link_id),
+            )
+            return claimed.rowcount == 1
+
+    def finish_webhook(self, *, dedupe_key: str, outcome: str, **detail: Any) -> None:
+        """Records how a claimed webhook delivery turned out."""
+        with _WRITE_LOCK, self._connect() as conn:
+            conn.execute(
+                "UPDATE webhook_events SET outcome = ?, detail = ? WHERE dedupe_key = ?",
+                (
+                    outcome,
+                    json.dumps(detail, sort_keys=True, default=str) if detail else None,
+                    dedupe_key,
+                ),
+            )
+
+    def mark_batch_paid(
+        self,
+        *,
+        payment_link_id: str,
+        amount_paid_paise: int,
+        razorpay_payment_id: str | None,
+    ) -> Mapping[str, Any] | None:
+        """Marks a batch actually paid, on confirmation from Razorpay.
+
+        This is the only place a batch becomes `paid`. The settlement run that
+        created the link deliberately does not, because creating an invoice is
+        not evidence that anyone settled it.
+
+        Conditional on the batch not already being paid, for the same reason
+        `create_commitment` claims its offer conditionally — the check and the
+        write have to be one statement or a concurrent redelivery slips
+        between them.
+
+        Args:
+            payment_link_id: Razorpay's `plink_...` id.
+            amount_paid_paise: What Razorpay says arrived, in paise.
+            razorpay_payment_id: The underlying `pay_...` id, when present.
+
+        Returns:
+            The updated batch row, or None if there is no such link or it was
+            already marked paid.
+        """
+        with _WRITE_LOCK, self._connect() as conn:
+            updated = conn.execute(
+                "UPDATE batches SET status = 'paid', paid_at = ?, amount_paid_paise = ?,"
+                " razorpay_payment_id = ?"
+                " WHERE payment_link_id = ? AND status <> 'paid'",
+                (utc_now(), int(amount_paid_paise), razorpay_payment_id, payment_link_id),
+            )
+            if updated.rowcount == 0:
+                return None
+            return conn.execute(
+                "SELECT * FROM batches WHERE payment_link_id = ?", (payment_link_id,)
+            ).fetchone()
+
+    def release_batch(
+        self, *, payment_link_id: str, status: str
+    ) -> Mapping[str, Any] | None:
+        """Voids an unpaid batch and returns its commitments to the queue.
+
+        For `payment_link.expired` and `payment_link.cancelled`: the invoice
+        will never be paid, but the debt behind it is still real. Detaching
+        the commitments and setting them back to `pending` puts them in front
+        of the next settlement run, which re-bills them on a fresh link.
+
+        Deliberately refuses to touch a batch that is already `paid`. An
+        `expired` event can legitimately arrive after a `paid` one — Razorpay
+        expires the link on schedule regardless of whether it was used — and
+        acting on it would un-collect money that was genuinely received.
+
+        Args:
+            payment_link_id: Razorpay's `plink_...` id.
+            status: New batch status, "expired" or "cancelled".
+
+        Returns:
+            The updated batch row, or None if there is no such link or it was
+            already paid or already in this state.
+        """
+        with _WRITE_LOCK, self._connect() as conn:
+            updated = conn.execute(
+                "UPDATE batches SET status = ?"
+                " WHERE payment_link_id = ? AND status NOT IN ('paid', ?)",
+                (status, payment_link_id, status),
+            )
+            if updated.rowcount == 0:
+                return None
+
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE payment_link_id = ?", (payment_link_id,)
+            ).fetchone()
+            conn.execute(
+                "UPDATE commitments SET status = 'pending', batch_id = NULL WHERE batch_id = ?",
+                (batch["batch_id"],),
+            )
+            return batch
+
     # -- reporting ---------------------------------------------------------
 
     def revenue_below(self, amount_paise: int, settle_date: str | None = None) -> dict:
@@ -584,11 +916,27 @@ class Ledger:
                 params,
             ).fetchone()
 
+            # Money Razorpay has actually confirmed, as distinct from money
+            # that has been billed. Reads `amount_paid_paise` — what the
+            # webhook reported arriving — rather than the batch total, so a
+            # partial payment is not rounded up into a full one.
+            collected = conn.execute(
+                "SELECT COALESCE(SUM(amount_paid_paise), 0) AS collected,"
+                " COUNT(*) AS paid_batches"
+                f" FROM batches WHERE status = 'paid' AND settle_date = ?{agent_filter}",
+                params,
+            ).fetchone()
+
         return {
             "settleDate": settle_date,
             "agentId": agent_id,
             "requests": totals["requests"],
             "totalPaise": totals["total_paise"],
+            # Explicit aliases for the two questions `totalPaise` alone is
+            # ambiguous about. See the module docstring: billed is not banked.
+            "committedPaise": totals["total_paise"],
+            "collectedPaise": collected["collected"],
+            "paidBatches": collected["paid_batches"],
             "rejectedPayments": rejections["n"],
             "byAgent": [dict(r) for r in by_agent],
             "byResource": [dict(r) for r in by_resource],

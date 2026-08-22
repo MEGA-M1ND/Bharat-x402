@@ -38,7 +38,7 @@ sequenceDiagram
     F->>L: store signed, single-use, 5-min offer
     F-->>A: offer + commitmentTemplate
 
-    Note over A: HMAC-sign acceptance<br/>of the quote
+    Note over A: Ed25519-sign acceptance<br/>with the agent's own key
 
     A->>P: GET + X-PAYMENT
     P->>F: POST /verify
@@ -166,11 +166,18 @@ economics were designed for, and nobody is collecting it. The gap is not authori
 it is aggregation. Something has to hold a running tab and settle it periodically, which
 is a payments-company problem rather than a publisher problem.
 
-**UPI Autopay is the natural end state, and this shape is already compatible with it.**
-Payment Links are used here because they are the simplest thing that demonstrably works
-in test mode. The commitment ledger does not care what settles it — swapping the batch
-charge for a mandate debit touches `razorpay_client.py` and nothing else. An agent
-operator with a mandate is a far better fit than a hosted checkout page nobody opens.
+**UPI Reserve Pay is the natural end state, and this shape is already compatible with
+it.** Payment Links are used here because they are the simplest thing that demonstrably
+works in test mode. The commitment ledger does not care what settles it — swapping the
+batch charge for a mandate debit touches `razorpay_client.py` and nothing else.
+
+Specifically **Reserve Pay (UPI SBMD — Single Block, Multiple Debits)**, not UPI Autopay.
+The two are easy to conflate and are different instruments: Autopay is fixed-schedule
+recurring collection, which does not describe agent traffic at all, whereas Reserve Pay
+blocks funds up front under a consent carrying spend limits and lets the payee debit
+against that block as usage occurs. That is exactly the shape of a running tab, and it
+is the rail Razorpay's own agentic-payments product uses. An agent operator with a
+Reserve Pay consent is a far better fit than a hosted checkout page nobody opens.
 
 **Deferred settlement is a facilitator product, not a publisher feature.** Every
 publisher who wants this needs the same ledger, the same batching, the same reporting.
@@ -217,15 +224,16 @@ mostly this list.
 
 | Area | Here | Production |
 | --- | --- | --- |
-| **Payment proofs** | HMAC-SHA256 with a secret shared by agent, publisher, and facilitator | Per-agent keypair (Ed25519 for a non-EVM rail). The current scheme has **no non-repudiation** — the facilitator holds the key it verifies with, so it could forge any agent's commitment. A disputed charge cannot be adjudicated from the proof. Only `payment_verifier.py` changes. |
-| **Settlement instrument** | One-off Payment Link per agent per day | UPI Autopay mandate, debited automatically. Removes the human from the loop entirely. |
-| **Agent identity** | A self-asserted string | Registered agent credentials, rate limits, per-agent spending caps |
+| **Payment proofs** | **Ed25519 per agent** — the agent signs with a key the facilitator does not hold, so a commitment is evidence rather than a checksum. The offer signature stays HMAC on purpose: there the facilitator is both signer and only verifier. | Same primitive. What changes is key *distribution*, below. |
+| **Agent identity** | Trust-on-first-use: the first caller to claim an agent id owns it. Rebinding to a different key is refused, so rotation and takeover are not the same request. | Keys issued at onboarding, bound to the merchant account that settles, with rate limits and per-agent spending caps. An authenticated channel for rotation. |
+| **Legacy proofs** | HMAC fallback still accepted from agents with no registered key (`ALLOW_HMAC_FALLBACK`), every use logged as a downgrade | Fallback off. Registration mandatory — the suite already covers that end state. |
+| **Settlement instrument** | One-off Payment Link per agent per day | UPI **Reserve Pay** (SBMD) consent, debited as usage accrues. Removes the hosted checkout page from a machine-to-machine flow entirely. Not Autopay — see above. |
 | **`payTo`** | Opaque string | Validated Razorpay account, with a real publisher onboarding flow |
-| **Ledger** | SQLite, single writer behind a lock | Postgres, with the commitment table partitioned by settlement date |
-| **Batch failure** | Commitments stay pending, retried next run | Dead-letter queue, alerting, partial-batch recovery, reconciliation against Razorpay's own records |
-| **Replay protection** | Single-use offers with expiry | Same, plus a distributed nonce cache so multiple facilitator instances agree |
-| **Razorpay calls** | Verified against real test-mode keys — links created, fetched back, and reconciled. No webhook handling, so a link that is actually *paid* does not update the ledger | Webhook endpoint for `payment_link.paid`, reconciliation against Razorpay's settlement reports |
-| **Secrets** | `.env` files | A secret manager; the HMAC secret becomes per-agent public keys and stops being a secret at all |
+| **Ledger** | SQLite locally, Postgres in production, behind `db.py`'s dialect shim; the whole suite runs on both in CI | Same, plus the commitment table partitioned by settlement date |
+| **Batch failure** | Commitments stay pending, retried next run. An expired or cancelled link returns its commitments to the queue via webhook. | Dead-letter queue, alerting, partial-batch recovery, reconciliation against Razorpay's own settlement reports |
+| **Replay protection** | Single-use offers with expiry; webhook deliveries deduplicated on a primary key | Same, plus a distributed nonce cache so multiple facilitator instances agree |
+| **Payment confirmation** | **Signature-verified `payment_link.paid` webhook**, exactly-once, moving a batch from `created` to `paid`. `committedPaise` and `collectedPaise` are reported separately. | Same, plus periodic reconciliation against settlement reports to catch webhooks that never arrived at all |
+| **Secrets** | `.env` files. The facilitator holds no agent private keys — only public ones. | A secret manager for the remaining symmetric secrets (offer signing, webhook verification) |
 
 ### Deliberately kept, not simplified
 

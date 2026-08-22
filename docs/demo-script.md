@@ -129,7 +129,7 @@ curl -sD - -o /dev/null http://localhost:3402/premium/market-report | grep -i '^
     "asset": "INR",
     "payTo": "acc_BharatNewsNetwork",
     "maxTimeoutSeconds": 300,
-    "extra": { "humanAmount": "₹5.00", "settlementMode": "deferred", "proofScheme": "hmac-sha256" }
+    "extra": { "humanAmount": "₹5.00", "settlementMode": "deferred", "proofScheme": "ed25519" }
   }]
 }
 ```
@@ -371,12 +371,19 @@ pytest tests -v
 ```
 
 ```
-60 passed in 11.70s
+132 passed in 11.70s
 ```
 
-With both services running, the four integration tests exercise the real HTTP path. With
-them stopped you get `52 passed, 4 skipped`. To make skipping fatal — which is what CI
-does — set `REQUIRE_INTEGRATION=1`.
+With both services running, the integration tests exercise the real HTTP path. With them
+stopped you get `122 passed, 10 skipped`. To make skipping fatal — which is what CI does —
+set `REQUIRE_INTEGRATION=1`.
+
+The same suite also runs against real Postgres rather than SQLite, which is how the
+dialect shim in `db.py` is held honest:
+
+```bash
+TEST_LEDGER_DSN=postgres://user:pass@host:5432/db LEDGER_AUTO_MIGRATE=1 pytest tests -q
+```
 
 ```bash
 ruff check facilitator demo-agent reporting tests
@@ -403,7 +410,10 @@ docker compose up --build
 | Symptom | Cause |
 | --- | --- |
 | `unreachable  [Errno 111] Connection refused` | A service is not running. Check both terminals from step 2. |
-| 402 on every attempt, `invalid_signature` | The HMAC secret differs between `.env` files. `X402_HMAC_SECRET` in `resource-server/.env` and `demo-agent/.env` must equal `FACILITATOR_HMAC_SECRET` in `facilitator/.env`. |
+| 402 on every attempt, `invalid_signature` | The agent is signing with a key the facilitator does not have on file — usually a deleted `demo-agent/.keys/<agent-id>.key` against a facilitator that still remembers the old public key. Pick a fresh `--agent-id`, or reset the ledger (below). On `--legacy-hmac` runs it instead means the shared secret differs between `.env` files, *or* that this agent has a registered key and is correctly being refused the downgrade. |
+| `agent-… is registered with a different public key` | Same cause, reported at registration instead of at payment. Rebinding an id to a new key is refused deliberately — see `Ledger.register_agent`. |
+| `agent_not_registered` | The facilitator has `ALLOW_HMAC_FALLBACK=false`, so an agent must register an Ed25519 key before paying. Drop `--legacy-hmac`. |
+| `webhooks_not_configured` on `/webhooks/razorpay` | No `RAZORPAY_WEBHOOK_SECRET` is set. The endpoint fails closed rather than accepting unauthenticated ledger writes. |
 | `offer_expired` | Offers last 5 minutes. Raise `OFFER_TTL_SECONDS` if you are stepping through by hand. |
 | `503 settlement_unavailable` | The publisher started before the facilitator and is still waiting. It fails closed rather than serving paid content free. |
 | Garbled `₹` or box characters | A console that is not UTF-8. Both scripts fall back to ASCII, but `chcp 65001` on Windows fixes it properly. |
