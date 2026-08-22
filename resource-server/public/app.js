@@ -39,6 +39,9 @@ const state = {
   facilitatorUrl: null,
   resources: [],
   scope: "mine", // "mine" | "all"
+  // The signed commitment from the last successful run, kept so the visitor
+  // can re-check it themselves. Cleared on a forged run — see captureProof.
+  lastProof: null,
 };
 
 // --------------------------------------------------------------- identity
@@ -193,6 +196,10 @@ function wireButtons() {
   document.getElementById("btn-forge").addEventListener("click", () => runNegotiation({ tamper: true }));
   document.getElementById("btn-burst").addEventListener("click", runBurst);
   document.getElementById("btn-settle").addEventListener("click", onSettleClick);
+  document.getElementById("btn-verify").addEventListener("click", () => verifyProof({ tamper: false }));
+  document
+    .getElementById("btn-verify-tamper")
+    .addEventListener("click", () => verifyProof({ tamper: true }));
 
   document.querySelectorAll(".scope-toggle__btn").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -216,6 +223,9 @@ async function runNegotiation({ tamper }) {
   const resource = document.getElementById("resource-select").value;
   setActionButtonsDisabled(true);
   document.getElementById("result").hidden = true;
+  // Hidden up front so a failed or forged run cannot leave the previous run's
+  // proof sitting there looking like it belongs to this one.
+  document.getElementById("card-verify").hidden = true;
 
   try {
     const run = await fetchJson(`${state.facilitatorUrl}/demo/run`, {
@@ -230,6 +240,7 @@ async function runNegotiation({ tamper }) {
     });
     await renderStepsSequentially(run.steps);
     renderResult(run);
+    captureProof(run);
     await refreshDashboard();
   } catch (err) {
     renderFatalError(err);
@@ -241,6 +252,7 @@ async function runNegotiation({ tamper }) {
 async function runBurst() {
   setActionButtonsDisabled(true);
   document.getElementById("result").hidden = true;
+  document.getElementById("card-verify").hidden = true;
 
   const stepsEl = document.getElementById("steps");
   stepsEl.innerHTML = "";
@@ -413,6 +425,156 @@ function renderResult(run) {
   }
 
   el.innerHTML = html;
+}
+
+// ------------------------------------------------- verify it in the browser
+//
+// The point of moving off a shared secret was that the facilitator can check
+// an agent's payment and cannot manufacture one. That is a claim about which
+// key sits where, and a claim is worth much less than something a sceptic can
+// run themselves — so this does the verification client-side, against a public
+// key fetched from the facilitator rather than one handed over in the trace.
+//
+// Ed25519 in WebCrypto is relatively recent (Chrome 137+, Firefox 129+,
+// Safari 17+), so every path here degrades to an explanation rather than a
+// broken button.
+
+function captureProof(run) {
+  const card = document.getElementById("card-verify");
+  const step = (run.steps || []).find((s) => s.n === 3 && s.decoded);
+
+  // Only a successful, untampered run leaves something worth verifying. A
+  // forged run already failed at step 4 and its signature is *meant* to be bad.
+  if (!run.ok || !step || step.decoded.tampered) {
+    state.lastProof = null;
+    card.hidden = true;
+    return;
+  }
+
+  state.lastProof = {
+    canonicalJson: step.decoded.canonicalJson,
+    signature: step.decoded.signature,
+    publicKeyFromTrace: step.decoded.agentPublicKey,
+    agentId: run.agentId,
+  };
+  card.hidden = false;
+  setVerifyOutput(
+    "muted",
+    "Runs in your browser with WebCrypto, against the key served from " +
+      "<code>/agents/&lt;id&gt;</code>. Nothing here is taken on trust."
+  );
+}
+
+function setVerifyOutput(kind, html) {
+  const el = document.getElementById("verify-out");
+  el.className = `verify__out ${kind}`;
+  el.innerHTML = html;
+}
+
+function b64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function importAgentKey(publicKeyB64) {
+  return crypto.subtle.importKey(
+    "raw",
+    b64ToBytes(publicKeyB64),
+    { name: "Ed25519" },
+    false,
+    ["verify"]
+  );
+}
+
+async function verifyProof({ tamper }) {
+  const proof = state.lastProof;
+  if (!proof) return;
+
+  if (!window.isSecureContext || !crypto.subtle) {
+    setVerifyOutput(
+      "verify--bad",
+      "WebCrypto needs a secure context (https or localhost), so this browser can't " +
+        "run the check here. The signature is still verified server-side on every payment."
+    );
+    return;
+  }
+
+  setVerifyOutput("muted", "Fetching this agent's public key from the facilitator…");
+
+  let registered;
+  try {
+    // Deliberately re-fetched rather than reusing the key from the trace: a
+    // verification against a key supplied by the same response it is checking
+    // would prove nothing.
+    const record = await fetchJson(
+      `${state.facilitatorUrl}/agents/${encodeURIComponent(proof.agentId)}`
+    );
+    registered = record.publicKey;
+  } catch (err) {
+    setVerifyOutput("verify--bad", `Could not fetch the public key: ${escapeHtml(err.message)}`);
+    return;
+  }
+
+  let key;
+  try {
+    key = await importAgentKey(registered);
+  } catch {
+    setVerifyOutput(
+      "verify--bad",
+      "This browser's WebCrypto doesn't support Ed25519 yet — needs Chrome 137+, " +
+        "Firefox 129+, or Safari 17+. The signature is still verified server-side."
+    );
+    return;
+  }
+
+  // Changing the amount is the tamper worth showing: it is exactly the edit
+  // someone would make if a commitment could be rewritten after the fact.
+  const message = tamper ? cheapenAmount(proof.canonicalJson) : proof.canonicalJson;
+
+  const valid = await crypto.subtle.verify(
+    { name: "Ed25519" },
+    key,
+    b64ToBytes(proof.signature),
+    new TextEncoder().encode(message)
+  );
+
+  const matchesTrace = registered === proof.publicKeyFromTrace;
+
+  if (!tamper && valid) {
+    setVerifyOutput(
+      "verify--ok",
+      `<strong>✓ Signature valid.</strong> Checked in this browser against ` +
+        `<code>${escapeHtml(registered.slice(0, 22))}…</code>, fetched from the ` +
+        `facilitator's own registry${matchesTrace ? " and matching the key in the trace above" : ""}. ` +
+        `The facilitator holds no private key for this agent, so it could verify this ` +
+        `payment but could not have produced it.`
+    );
+  } else if (tamper && !valid) {
+    setVerifyOutput(
+      "verify--ok",
+      `<strong>✓ Tamper rejected.</strong> The amount owed was rewritten to ` +
+        `<code>1 paisa</code> and the same signature no longer verifies. A commitment ` +
+        `cannot be edited after it is signed — not by the agent, and not by the ` +
+        `facilitator holding it.`
+    );
+  } else {
+    // Neither branch should be reachable; say so plainly rather than quietly
+    // rendering a green tick for the wrong outcome.
+    setVerifyOutput(
+      "verify--bad",
+      `<strong>Unexpected result.</strong> tampered=${tamper}, valid=${valid}. ` +
+        `That should not happen — please open an issue.`
+    );
+  }
+}
+
+function cheapenAmount(canonicalJson) {
+  const cheapened = canonicalJson.replace(/"amountPaise":\d+/, '"amountPaise":1');
+  // If the field ever gets renamed, fall back to a byte flip so the button
+  // still demonstrates a rejection rather than silently verifying fine.
+  return cheapened === canonicalJson ? `${canonicalJson} ` : cheapened;
 }
 
 function renderFatalError(err) {

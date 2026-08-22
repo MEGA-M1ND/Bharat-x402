@@ -731,6 +731,49 @@ code,
   border-radius: 0 6px 6px 0;
 }
 
+/* --------------------------------------------------------- verify-it card */
+
+.card--verify {
+  margin-top: 12px;
+}
+
+.verify__row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.verify__out {
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  /* Uses theme tokens rather than a fixed light background, unlike .result
+     and .stat-tile — those keep a light "paper" background in both themes and
+     needed their text colour pinned in the dark-mode block below to stay
+     readable. Inheriting the tokens avoids repeating that trap. */
+  background: var(--canvas);
+}
+
+.verify__out code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.verify--ok {
+  border-color: #abefc6;
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.verify--bad {
+  border-color: #fda29b;
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+
 /* ----------------------------------------------------------------- footer */
 
 .footer {

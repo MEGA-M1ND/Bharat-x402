@@ -213,6 +213,58 @@ jobs:
           status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3402/premium/api-call)
           test "$status" = "402"
 
+          # The verify-it-yourself card. Its absence would not break any other
+          # check, so it gets its own.
+          curl -sf http://localhost:3402/ | grep -q 'id="card-verify"'
+
+      # The console lets a visitor verify a commitment signature in their own
+      # browser, using WebCrypto against the public key from /agents/<id>.
+      # That depends on three things the demo API has no other reason to
+      # emit — canonicalJson, signature, agentPublicKey — so a refactor could
+      # silently leave the button verifying nothing.
+      #
+      # This reproduces the browser's check in Python: same key source, same
+      # bytes, same primitive, plus the tamper case the UI demonstrates.
+      - name: Console's signature-verification demo actually verifies
+        run: |
+          curl -sf -X POST http://localhost:8402/demo/run \
+            -H 'Content-Type: application/json' \
+            -d '{"sessionId":"ci-verify-session","agentLabel":"ci-bot","resource":"market-report"}' \
+            -o /tmp/verify_run.json
+          python -c '
+          import base64, json, re, urllib.request
+          from cryptography.exceptions import InvalidSignature
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+          run = json.load(open("/tmp/verify_run.json", encoding="utf-8"))
+          assert run["ok"] is True, run
+          step = next(s for s in run["steps"] if s["n"] == 3)
+          decoded = step["decoded"]
+          for field in ("canonicalJson", "signature", "agentPublicKey"):
+              assert decoded.get(field), f"demo/run step 3 lost {field} — the console verifier needs it"
+
+          # The key must come from the public registry, not from the response
+          # being checked: verifying against a key supplied by the same
+          # payload would prove nothing.
+          url = "http://localhost:8402/agents/" + run["agentId"]
+          registered = json.load(urllib.request.urlopen(url))["publicKey"]
+          assert registered == decoded["agentPublicKey"], "registry key != key in trace"
+
+          key = Ed25519PublicKey.from_public_bytes(base64.b64decode(registered))
+          sig = base64.b64decode(decoded["signature"])
+          key.verify(sig, decoded["canonicalJson"].encode())
+          print("signature verifies against the registered public key")
+
+          tampered = re.sub(r"\"amountPaise\":\d+", "\"amountPaise\":1", decoded["canonicalJson"])
+          assert tampered != decoded["canonicalJson"], "tamper produced identical bytes"
+          try:
+              key.verify(sig, tampered.encode())
+          except InvalidSignature:
+              print("rewriting the amount correctly invalidates the signature")
+          else:
+              raise AssertionError("a rewritten amount still verified — non-repudiation is broken")
+          '
+
       # POST /demo/run is the console's server-side agent runner — this is
       # what a click of "Fetch as AI agent" actually calls.
       - name: Console's demo API completes a negotiation

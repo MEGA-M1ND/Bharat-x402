@@ -87,6 +87,29 @@
       <ol class="steps" id="steps" aria-live="polite"></ol>
 
       <div class="result" id="result" hidden></div>
+
+      <div class="card card--verify" id="card-verify" hidden>
+        <div class="card__head">
+          <h3>Don't take our word for it</h3>
+          <p class="card__sub">
+            The facilitator stores only this agent's <em>public</em> key, so it can check a
+            payment but could never have written one. Prove that here — your browser fetches
+            the key from the facilitator and verifies the signature itself.
+          </p>
+        </div>
+        <div class="verify__row">
+          <button id="btn-verify" class="btn btn--small" type="button">
+            Verify the signature
+          </button>
+          <button id="btn-verify-tamper" class="btn btn--small btn--ghost" type="button">
+            Now change the amount owed
+          </button>
+        </div>
+        <div id="verify-out" class="verify__out muted">
+          Runs in your browser with WebCrypto, against the key served from
+          <code>/agents/&lt;id&gt;</code>. Nothing here is taken on trust.
+        </div>
+      </div>
     </section>
 
     <!-- ============ RIGHT: publisher dashboard ============ -->
