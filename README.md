@@ -255,6 +255,22 @@ The offer signature is *still* HMAC, deliberately: there the facilitator is both
 verifier, so a symmetric MAC is the correct primitive rather than a leftover. Reasoning in
 [`payment_verifier.py`](facilitator/payment_verifier.py).
 
+**And you can check that claim yourself.** "The facilitator can verify a payment but could never
+have written one" is an assertion about which key sits where — worth much less than something a
+sceptic can run. So the console verifies a commitment **in your browser**, with WebCrypto, against
+the public key it fetches from `/agents/<id>` rather than one handed over in the same response:
+
+```
+✓ Signature valid.   Checked in this browser against VYcYaZHz0kdZgw3Ij56PQ3…, fetched from
+                     the facilitator's own registry and matching the key in the trace above.
+
+✓ Tamper rejected.   The amount owed was rewritten to 1 paisa and the same signature no
+                     longer verifies.
+```
+
+CI reproduces exactly that check in Python — same key source, same bytes, same primitive, plus the
+tamper case — so the button can't quietly end up verifying nothing.
+
 ### 2. Billed is not banked
 
 `POST /settle-batch` creates a Payment Link. That is an **invoice**, not a receipt. Money is only
