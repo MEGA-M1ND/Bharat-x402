@@ -23,5 +23,8 @@
   "rewrites": [
     { "source": "/api/facilitator/(.*)", "destination": { "service": "facilitator" } },
     { "source": "/(.*)", "destination": { "service": "resource" } }
+  ],
+  "crons": [
+    { "path": "/api/facilitator/health", "schedule": "0 5 * * *" }
   ]
 }

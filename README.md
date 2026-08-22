@@ -318,6 +318,13 @@ This is a portfolio demo, not a payment system.
   makes registration mandatory, and the suite covers that end state.
 - **No UPI Reserve Pay integration** — it is in closed beta, so settlement here is Payment Links,
   which is why a human-facing checkout page still appears in a machine-to-machine flow.
+- **The hosted demo keeps itself alive with a daily cron.** Supabase pauses a free-tier project
+  after about a week idle, which for a link on a job application means the demo is broken exactly
+  when someone finally clicks it. `vercel.json` schedules a daily `GET /api/facilitator/health`,
+  which runs a real `SELECT 1` against Postgres — a request that only touched the CDN would not
+  count as database activity and would not prevent the pause. Daily rather than weekly because
+  Vercel's Hobby plan allows one run per day with ±59 minutes of jitter, so a weekly job buys
+  no headroom over a daily one and leaves far less margin.
 
 Every simplification is listed with what production would change in
 [docs/architecture.md](docs/architecture.md#simplifications-and-what-production-would-change).
