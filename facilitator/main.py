@@ -1264,6 +1264,13 @@ def economics(settleDate: str | None = None, agentId: str | None = None) -> dict
         "settleDate": settle_date,
         "agentId": agentId,
         "economics": estimate_settlement_cost(amounts, fee_model) if amounts else None,
+        # Charges grouped by size, so a client can draw the gateway floor
+        # rather than being told about it. Same numbers as `economics`, shaped
+        # for a chart instead of a paragraph.
+        "distribution": ledger.commitment_histogram(
+            agent_id=agentId, settle_date=settle_date
+        ),
+        "gatewayMinimumPaise": fee_model.minimum_charge_paise,
     }
 
 

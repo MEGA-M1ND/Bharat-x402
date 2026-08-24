@@ -1176,6 +1176,52 @@ class Ledger:
         with self._connect() as conn:
             return [int(r["amount_paise"]) for r in conn.execute(query, params).fetchall()]
 
+    def commitment_histogram(
+        self, *, agent_id: str | None = None, settle_date: str | None = None
+    ) -> list[dict]:
+        """A day's charges grouped by size, cheapest first.
+
+        Exists so the console can draw the argument instead of stating it: a
+        bar per price point with the gateway minimum marked, where everything
+        left of that line is revenue with no per-request path. The totals in
+        `estimate_settlement_cost` say the same thing in prose, and a reader
+        has to take them on faith.
+
+        Grouped in SQL rather than by returning every amount, because this is
+        a public read on a shared deployment and a day of agent traffic is
+        thousands of rows the browser has no use for.
+
+        Args:
+            agent_id: Narrow to one agent. Omit for the whole day.
+            settle_date: Day to inspect. Defaults to today UTC.
+
+        Returns:
+            `[{"amountPaise": ..., "count": ..., "totalPaise": ...}, ...]`.
+        """
+        settle_date = settle_date or today_utc()
+        query = (
+            "SELECT amount_paise, COUNT(*) AS n,"
+            " COALESCE(SUM(amount_paise), 0) AS total"
+            " FROM commitments WHERE settle_date = ?"
+        )
+        params: list[Any] = [settle_date]
+        if agent_id:
+            query += " AND agent_id = ?"
+            params.append(agent_id)
+        query += " GROUP BY amount_paise ORDER BY amount_paise ASC"
+
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        return [
+            {
+                "amountPaise": int(row["amount_paise"]),
+                "count": int(row["n"]),
+                "totalPaise": int(row["total"]),
+            }
+            for row in rows
+        ]
+
     def list_events(
         self,
         *,

@@ -42,6 +42,12 @@ const state = {
   // The signed commitment from the last successful run, kept so the visitor
   // can re-check it themselves. Cleared on a forged run — see captureProof.
   lastProof: null,
+  // Live feed: the highest event id already on screen, and the pending timer.
+  // `busy` suppresses polling while a negotiation is mid-flight, so the two
+  // are not refreshing the dashboard over each other.
+  lastEventId: null,
+  pollTimer: null,
+  busy: false,
 };
 
 // --------------------------------------------------------------- identity
@@ -145,6 +151,7 @@ async function init() {
   await Promise.all([loadResources(), loadStatusChips()]);
   wireButtons();
   await refreshDashboard();
+  startLiveFeed();
 }
 
 function showOfflineBanner() {
@@ -215,6 +222,9 @@ function setActionButtonsDisabled(disabled) {
   ["btn-fetch", "btn-forge", "btn-burst"].forEach((id) => {
     document.getElementById(id).disabled = disabled;
   });
+  // Doubles as the live-feed guard: while a run is in flight the poll would
+  // be refreshing the dashboard underneath it.
+  state.busy = disabled;
 }
 
 // -------------------------------------------------------------- the agent
@@ -594,7 +604,7 @@ function renderFatalError(err) {
 
 // -------------------------------------------------------------- dashboard
 
-async function refreshDashboard() {
+async function refreshDashboard({ skipActivity = false } = {}) {
   try {
     const params = new URLSearchParams();
     if (state.scope === "mine") params.set("agentId", state.agentId);
@@ -603,8 +613,14 @@ async function refreshDashboard() {
     renderStats(summary);
     renderBatches((summary.batches || []).map(camelizeRow));
 
-    if (state.scope === "mine") {
+    // `skipActivity` is for the live poll, which has already appended the new
+    // rows with their highlight. Re-rendering the list here would replace
+    // them with identical un-highlighted ones and throw away the only visual
+    // cue that something just arrived.
+    if (state.scope === "mine" && !skipActivity) {
       await renderActivity();
+    } else if (state.scope === "mine") {
+      // nothing — the poll owns the list this time round
     } else {
       renderTopPayers((summary.byAgent || []).map(camelizeRow));
     }
@@ -618,9 +634,100 @@ async function refreshDashboard() {
       `${state.facilitatorUrl}/economics?agentId=${encodeURIComponent(state.agentId)}`
     );
     renderEconomics(econRes.economics);
+    renderChargeChart(econRes);
   } catch {
     showOfflineBanner();
   }
+}
+
+// ------------------------------------------------------- the charge chart
+//
+// The economics card states that N charges fall under the gateway minimum.
+// This draws it, because the claim is spatial: the floor is a line, and the
+// bars that sit to the left of it are revenue with no per-request path at
+// all. A reader can check that by looking, which they cannot do with a
+// sentence.
+//
+// Inline SVG and no charting library, matching the rest of this page's
+// zero-build approach. It is a handful of rects.
+
+const CHART = { width: 420, height: 132, left: 52, right: 12, top: 10, bottom: 26 };
+
+function renderChargeChart(econRes) {
+  const el = document.getElementById("chart-body");
+  const rows = econRes.distribution || [];
+  const floor = econRes.gatewayMinimumPaise;
+
+  if (!rows.length) {
+    el.innerHTML =
+      '<p class="muted">Fetch a few resources to see how charge sizes fall either ' +
+      "side of the gateway minimum.</p>";
+    return;
+  }
+
+  const { width, height, left, right, top, bottom } = CHART;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+
+  // Log scale on the amount axis. Charge sizes here span two orders of
+  // magnitude (50 paise to ₹5+), and on a linear axis the sub-rupee bars —
+  // the entire point — collapse against the left edge.
+  const amounts = rows.map((r) => r.amountPaise);
+  const maxAmount = Math.max(...amounts, floor * 2);
+  const minAmount = Math.min(...amounts, floor / 2);
+  const logMin = Math.log10(Math.max(minAmount, 1));
+  const logMax = Math.log10(maxAmount);
+  const span = logMax - logMin || 1;
+  const xFor = (paiseValue) =>
+    left + ((Math.log10(Math.max(paiseValue, 1)) - logMin) / span) * plotW;
+
+  const maxCount = Math.max(...rows.map((r) => r.count));
+  const barH = Math.max(6, Math.min(20, plotH / rows.length - 6));
+
+  const floorX = xFor(floor);
+  let svg =
+    `<svg viewBox="0 0 ${width} ${height}" role="img" ` +
+    `aria-label="Charge sizes against the ${paise(floor)} gateway minimum" class="chart">`;
+
+  // The floor, drawn first so bars sit on top of it.
+  svg +=
+    `<line x1="${floorX.toFixed(1)}" y1="${top - 4}" x2="${floorX.toFixed(1)}" ` +
+    `y2="${height - bottom + 4}" class="chart__floor" />` +
+    `<text x="${floorX.toFixed(1)}" y="${height - bottom + 18}" ` +
+    `class="chart__floor-label" text-anchor="middle">${paise(floor)} floor</text>`;
+
+  rows.forEach((row, i) => {
+    const y = top + i * (barH + 6);
+    const below = row.amountPaise < floor;
+    const barW = Math.max(2, (row.count / maxCount) * (plotW * 0.62));
+    // Bars grow rightward from the amount's own position, so a bar's left
+    // edge is its price and its length is how often that price was charged.
+    const x = xFor(row.amountPaise);
+
+    svg +=
+      `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" ` +
+      `height="${barH.toFixed(1)}" rx="2" ` +
+      `class="chart__bar ${below ? "chart__bar--below" : "chart__bar--above"}" />` +
+      `<text x="${left - 6}" y="${(y + barH / 2 + 3.5).toFixed(1)}" ` +
+      `class="chart__ylabel" text-anchor="end">${paise(row.amountPaise)}</text>` +
+      `<text x="${(x + barW + 5).toFixed(1)}" y="${(y + barH / 2 + 3.5).toFixed(1)}" ` +
+      `class="chart__count">×${row.count}</text>`;
+  });
+
+  svg += "</svg>";
+
+  const below = rows.filter((r) => r.amountPaise < floor);
+  const belowCount = below.reduce((sum, r) => sum + r.count, 0);
+  const belowTotal = below.reduce((sum, r) => sum + r.totalPaise, 0);
+
+  const caption = belowCount
+    ? `<p class="chart__caption"><strong>${belowCount}</strong> charge${belowCount === 1 ? "" : "s"} ` +
+      `sit below the line, worth ${paise(belowTotal)}. Individually, Razorpay will not ` +
+      `process any of them.</p>`
+    : `<p class="chart__caption muted">Everything here clears the floor. Fetch the ` +
+      `${paise(50)} API call to put a bar on the left of the line.</p>`;
+
+  el.innerHTML = svg + caption;
 }
 
 function renderStats(summary) {
@@ -657,20 +764,107 @@ async function renderActivity() {
     );
     if (!data.events.length) {
       el.innerHTML = '<p class="muted">Nothing yet — fetch something on the left.</p>';
+      state.lastEventId = null;
       return;
     }
-    el.innerHTML = data.events
-      .map(
-        (e) =>
-          `<div class="activity-row">` +
-          `<span class="activity-row__event">${escapeHtml(EVENT_LABELS[e.event] || e.event)}</span>` +
-          `<span class="activity-row__detail">${escapeHtml(e.resourceId || "")}</span>` +
-          `<span class="activity-row__amount">${e.amountPaise != null ? paise(e.amountPaise) : ""}</span>` +
-          `</div>`
-      )
-      .join("");
+    el.innerHTML = data.events.map(activityRow).join("");
+    // Newest first, so the head of the list is the high-water mark the
+    // incremental poll continues from.
+    state.lastEventId = data.events[0].id;
   } catch {
     el.innerHTML = '<p class="muted">Could not load activity.</p>';
+  }
+}
+
+function activityRow(e, isNew = false) {
+  return (
+    `<div class="activity-row${isNew ? " activity-row--new" : ""}">` +
+    `<span class="activity-row__event">${escapeHtml(EVENT_LABELS[e.event] || e.event)}</span>` +
+    `<span class="activity-row__detail">${escapeHtml(e.resourceId || "")}</span>` +
+    `<span class="activity-row__amount">${e.amountPaise != null ? paise(e.amountPaise) : ""}</span>` +
+    `</div>`
+  );
+}
+
+// -------------------------------------------------------- the live feed
+//
+// `/ledger/events` has taken a `sinceId` since it was written and nothing
+// used it — the dashboard only refreshed when you clicked something. So a
+// settlement run, or another tab's traffic, appeared only if you happened to
+// act again.
+//
+// Two things keep this from being rude to a serverless deployment:
+//
+//   * `sinceId` means each poll asks for what is new rather than re-reading
+//     the window. The usual answer is an empty list.
+//   * It stops entirely while the tab is hidden. A console left open in a
+//     background tab overnight would otherwise bill for a poll every few
+//     seconds to show nobody anything.
+
+const POLL_INTERVAL_MS = 4000;
+
+function startLiveFeed() {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      // Catch up immediately rather than waiting out the interval — a tab
+      // being brought forward is exactly when someone wants to see the state.
+      pollEvents();
+      scheduleNextPoll();
+    } else {
+      clearTimeout(state.pollTimer);
+    }
+  });
+  scheduleNextPoll();
+}
+
+function scheduleNextPoll() {
+  clearTimeout(state.pollTimer);
+  if (document.visibilityState !== "visible") return;
+  state.pollTimer = setTimeout(async () => {
+    await pollEvents();
+    scheduleNextPoll();
+  }, POLL_INTERVAL_MS);
+}
+
+async function pollEvents() {
+  // Nothing to be incremental from yet, and the "all visitors" view is a
+  // different query — let the normal refresh own both.
+  if (state.lastEventId == null || state.scope !== "mine" || state.busy) return;
+
+  try {
+    const params = new URLSearchParams({
+      agentId: state.agentId,
+      sinceId: String(state.lastEventId),
+      limit: "8",
+    });
+    const data = await fetchJson(`${state.facilitatorUrl}/ledger/events?${params}`);
+    if (!data.events.length) return;
+
+    const el = document.getElementById("activity-body");
+
+    // Clear the marker from the previous batch first. The class outlives its
+    // animation, and `refreshDashboard({skipActivity: true})` deliberately
+    // does not re-render the list — so without this, every row ever appended
+    // by a poll stays flagged as new and the highlight stops meaning
+    // "this just arrived".
+    el.querySelectorAll(".activity-row--new").forEach((row) =>
+      row.classList.remove("activity-row--new")
+    );
+
+    // Response is newest-first; reversing means prepending each in turn
+    // leaves the newest at the top.
+    [...data.events].reverse().forEach((event) => {
+      el.insertAdjacentHTML("afterbegin", activityRow(event, true));
+    });
+    while (el.children.length > 8) el.lastElementChild.remove();
+
+    state.lastEventId = data.events[0].id;
+
+    // Something happened, so the totals and the chart are now stale too.
+    await refreshDashboard({ skipActivity: true });
+  } catch {
+    // A failed poll is not worth surfacing — the next one is four seconds
+    // away, and the offline banner already covers a genuinely dead service.
   }
 }
 

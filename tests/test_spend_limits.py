@@ -415,3 +415,55 @@ class TestLimitsAreDiscoverable:
 
         assert body["dailyCapPaise"] is None
         assert body["remainingPaise"] is None
+
+
+class TestChargeDistribution:
+    """The data behind the console's charge-size chart.
+
+    The economics card already reports how many charges fall under the gateway
+    minimum. This is the same fact shaped for a picture, so a reader can check
+    it by looking instead of taking a sentence on faith.
+    """
+
+    def test_charges_are_grouped_by_size_cheapest_first(self, ledger):
+        for i, amount in enumerate([500, 50, 500, 50, 50]):
+            offer_id = f"off_d{i}"
+            TestLedgerCapEnforcement()._open_offer(ledger, "agent-dist", offer_id, amount)
+            TestLedgerCapEnforcement()._commit(
+                ledger, "agent-dist", offer_id, amount, cap=10**9
+            )
+
+        rows = ledger.commitment_histogram(agent_id="agent-dist")
+        assert rows == [
+            {"amountPaise": 50, "count": 3, "totalPaise": 150},
+            {"amountPaise": 500, "count": 2, "totalPaise": 1000},
+        ]
+
+    def test_the_histogram_scopes_to_one_agent(self, ledger):
+        TestLedgerCapEnforcement()._open_offer(ledger, "agent-mine", "off_m", 500)
+        TestLedgerCapEnforcement()._commit(ledger, "agent-mine", "off_m", 500, cap=10**9)
+        TestLedgerCapEnforcement()._open_offer(ledger, "agent-theirs", "off_t", 50)
+        TestLedgerCapEnforcement()._commit(ledger, "agent-theirs", "off_t", 50, cap=10**9)
+
+        assert ledger.commitment_histogram(agent_id="agent-mine") == [
+            {"amountPaise": 500, "count": 1, "totalPaise": 500}
+        ]
+
+    def test_an_empty_day_is_an_empty_list_not_an_error(self, ledger):
+        assert ledger.commitment_histogram(agent_id="agent-nobody") == []
+
+    def test_economics_endpoint_carries_the_distribution_and_the_floor(
+        self, ledger_path, monkeypatch
+    ):
+        """The chart needs both — the bars, and the line to draw them against."""
+        main = _reload_main(monkeypatch, ledger_path)
+        with _client(main) as client:
+            envelope = payment_envelope(quote(client, agent_id="agent-c"), agent_id="agent-c")
+            client.post("/settle", json=envelope)
+
+            body = client.get("/economics", params={"agentId": "agent-c"}).json()
+
+        assert body["gatewayMinimumPaise"] == 100
+        assert body["distribution"] == [
+            {"amountPaise": PRICE_PAISE, "count": 1, "totalPaise": PRICE_PAISE}
+        ]

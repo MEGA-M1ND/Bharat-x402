@@ -15,7 +15,7 @@ whole negotiation yourself, no install.
 | Razorpay charges that took | **5** — one Payment Link per agent, 55 gateway calls avoided |
 | Revenue **impossible** to collect per-request | **₹30.00 of ₹30.00** — every charge under Razorpay's ₹1.00 floor |
 | Razorpay's ₹1 floor | verified by posting 50 paise to the live test API, not read off a doc |
-| Tests | **184** — 174 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
+| Tests | **188** — 178 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
 
 ```
       key   agent-perplexity-bot
@@ -407,11 +407,11 @@ The full breakdown, including where fixed fees *do* multiply, is in
 | `demo-agent/` | A crawler that holds its own keypair and narrates the whole negotiation as it pays |
 | `agent-kit/` | **The agent surface.** `x402_client.py` (the negotiation + the budget wall), `tools.py` (the five tools, defined once), `mcp_server.py` (MCP), `researcher.py` (a Claude agent that decides what to buy) |
 | `reporting/` | The publisher's daily revenue digest, formatted as a WhatsApp message |
-| `tests/` | 184 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall), `test_ledger_degradation.py` (behaviour when the ledger is down), `test_spend_limits.py` (the caps) |
+| `tests/` | 188 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall), `test_ledger_degradation.py` (behaviour when the ledger is down), `test_spend_limits.py` (the caps) |
 | `docs/` | [Architecture](docs/architecture.md) · [Demo script](docs/demo-script.md) |
 
 ```bash
-pytest tests -v                                     # 184 tests
+pytest tests -v                                     # 188 tests
 TEST_LEDGER_DSN=postgres://… pytest tests -q        # the same suite, on real Postgres
 ```
 
