@@ -22,6 +22,7 @@ HTTP, which tests the SDK rather than this code.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from dataclasses import dataclass, field
 
@@ -29,6 +30,14 @@ import pytest
 import researcher
 import tools
 from x402_client import X402Client
+
+# Only the schema tests below need the real SDK — they are checking what it
+# generates. CI installs `anthropic` so they actually run; a contributor who
+# has not installed the agent-kit extras gets skips rather than errors.
+needs_sdk = pytest.mark.skipif(
+    importlib.util.find_spec("anthropic") is None,
+    reason="anthropic SDK not installed (see agent-kit/requirements.txt)",
+)
 
 
 @dataclass
@@ -82,6 +91,7 @@ def client(tmp_path, monkeypatch):
     built.close()
 
 
+@needs_sdk
 class TestToolSchemasHandedToTheModel:
     def test_every_tool_produces_a_usable_schema(self):
         """The SDK builds these from signatures and docstrings. A refactor can
@@ -117,9 +127,9 @@ class TestToolSchemasHandedToTheModel:
 class TestTheLoop:
     def test_tool_calls_reach_the_payment_client(self, client, monkeypatch, capsys):
         """A tool_use block from the model has to actually run the tool."""
-        from anthropic import beta_tool
-
-        decorated = {fn.__name__: beta_tool(fn) for fn in tools.ALL_TOOLS}
+        # Plain functions: the runner stub calls them directly, so there is
+        # nothing here that needs the SDK's decorator.
+        decorated = {fn.__name__: fn for fn in tools.ALL_TOOLS}
         monkeypatch.setattr(
             client,
             "quote",

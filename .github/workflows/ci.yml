@@ -30,9 +30,15 @@ jobs:
           pip install -r facilitator/requirements.txt
           pip install -r demo-agent/requirements.txt
           pip install pytest ruff
+          # Just `anthropic`, not agent-kit/requirements.txt: that also pulls in
+          # the MCP SDK, which wants Starlette 1.x while FastAPI 0.115 pins <0.42.
+          # Installing both breaks the facilitator at import. This one package has
+          # no such conflict, and without it tests/test_researcher.py's schema
+          # checks would skip rather than run.
+          pip install anthropic
 
       - name: Lint
-        run: ruff check facilitator demo-agent reporting tests
+        run: ruff check facilitator demo-agent reporting agent-kit tests
 
       # No services running here, so the integration tests skip. They are run
       # for real in the smoke job below, where a skip is made fatal.
@@ -83,6 +89,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r facilitator/requirements.txt
           pip install pytest
+          # Just `anthropic`, not agent-kit/requirements.txt: that also pulls in
+          # the MCP SDK, which wants Starlette 1.x while FastAPI 0.115 pins <0.42.
+          # Installing both breaks the facilitator at import. This one package has
+          # no such conflict, and without it tests/test_researcher.py's schema
+          # checks would skip rather than run.
+          pip install anthropic
 
       - name: Full test suite against real Postgres
         run: pytest tests -v
@@ -130,6 +142,12 @@ jobs:
         run: |
           pip install -r facilitator/requirements.txt -r demo-agent/requirements.txt
           pip install pytest
+          # Just `anthropic`, not agent-kit/requirements.txt: that also pulls in
+          # the MCP SDK, which wants Starlette 1.x while FastAPI 0.115 pins <0.42.
+          # Installing both breaks the facilitator at import. This one package has
+          # no such conflict, and without it tests/test_researcher.py's schema
+          # checks would skip rather than run.
+          pip install anthropic
           npm --prefix resource-server ci
 
       # No secrets in CI: MOCK_RAZORPAY keeps the facilitator from making any
