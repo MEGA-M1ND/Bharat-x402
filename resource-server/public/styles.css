@@ -731,6 +731,73 @@ code,
   border-radius: 0 6px 6px 0;
 }
 
+/* ------------------------------------------------------- charge-size chart */
+
+.chart {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+/* Every colour here is a theme token, so the chart follows light and dark
+   without a second palette — the mistake that made three other cards
+   unreadable in dark mode. */
+.chart__bar--above {
+  fill: var(--accent);
+}
+
+.chart__bar--below {
+  fill: var(--warn);
+}
+
+.chart__floor {
+  stroke: var(--bad);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 3;
+}
+
+.chart__floor-label {
+  fill: var(--bad);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.chart__ylabel,
+.chart__count {
+  fill: var(--text-muted);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart__caption {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 6px 0 0;
+}
+
+/* --------------------------------------------------------- live feed rows */
+
+/* A brief tint on arrival, then back to normal. Enough to notice a row
+   appearing without leaving the list permanently striped. */
+@keyframes activity-arrive {
+  from {
+    background: var(--accent-soft);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.activity-row--new {
+  animation: activity-arrive 1.6s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-row--new {
+    animation: none;
+  }
+}
+
 /* --------------------------------------------------------- verify-it card */
 
 .card--verify {
