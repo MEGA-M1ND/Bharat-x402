@@ -54,6 +54,7 @@ import os
 import re
 import sys
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -70,6 +71,12 @@ import db
 _WRITE_LOCK = threading.Lock()
 
 DEFAULT_DB_PATH = os.getenv("LEDGER_DB_PATH", "./data/ledger.db")
+
+# How long `log_event` stops attempting audit inserts after one fails. Short,
+# because the cost of being wrong is only that recovery is noticed a few
+# seconds late; long enough that a burst of events during an outage does not
+# pay a connection timeout each. See `Ledger._audit_writes_allowed`.
+AUDIT_BREAKER_SECONDS = float(os.getenv("LEDGER_AUDIT_BREAKER_SECONDS", "30"))
 
 
 # Matches the `user:password@` portion of any connection URL. Database driver
@@ -262,6 +269,11 @@ class Ledger:
         self.dsn = dsn
         self.dialect = db.dialect_for(dsn)
 
+        # Zero means "closed" — attempt every audit insert. Set to a
+        # monotonic deadline when one fails. Only ever gates `log_event`;
+        # money writes are never suppressed.
+        self._audit_breaker_open_until = 0.0
+
         if self.dialect == "sqlite":
             self.db_path = dsn
             parent = os.path.dirname(os.path.abspath(dsn))
@@ -308,17 +320,31 @@ class Ledger:
             amount_paise: Money involved, in paise.
             status: Outcome marker, e.g. "ok" or "rejected".
             **detail: Anything else worth keeping; stored as JSON.
+
+        Never raises, and writes stdout *before* the database. Both of those
+        are deliberate, and they are the fix for a real failure this service
+        had: with Postgres unreachable, a rejected webhook spent ten seconds
+        blocking on the audit insert's pool timeout, then the exception
+        reached the unhandled-error handler, which called this method again
+        for another ten seconds, and a request that should have been a fast
+        400 became a slow 500. Razorpay would have timed out and retried,
+        adding load to a service already in trouble.
+
+        Ordering stdout first means the event survives a dead database rather
+        than being lost with it — the previous order lost both the row *and*
+        the log line. A failed insert is then reported as its own
+        `ledger_write_failed` line, so a degraded audit trail is greppable
+        instead of silent.
+
+        **This leniency is scoped to the audit log and must stay that way.**
+        Money writes — `create_commitment`, `record_batch`, `mark_batch_paid`
+        — raise on failure and have to keep raising: an unrecorded commitment
+        is revenue lost, whereas an unrecorded log line is still sitting in
+        stdout. Note that a dead ledger cannot produce a charged-but-unlogged
+        payment either, because the commitment write would have failed first.
         """
         ts = utc_now()
         detail_json = json.dumps(detail, sort_keys=True, default=str) if detail else None
-
-        with _WRITE_LOCK, self._connect() as conn:
-            conn.execute(
-                "INSERT INTO events"
-                " (ts, event, agent_id, resource_id, amount_paise, status, detail)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (ts, event, agent_id, resource_id, amount_paise, status, detail_json),
-            )
 
         line = {
             "ts": ts,
@@ -331,6 +357,61 @@ class Ledger:
             **detail,
         }
         print(json.dumps(line, sort_keys=True, default=str), file=sys.stdout, flush=True)
+
+        if not self._audit_writes_allowed():
+            return
+
+        try:
+            with _WRITE_LOCK, self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO events"
+                    " (ts, event, agent_id, resource_id, amount_paise, status, detail)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (ts, event, agent_id, resource_id, amount_paise, status, detail_json),
+                )
+        except Exception as exc:  # noqa: BLE001 - reported below, never raised
+            self._audit_breaker_open_until = time.monotonic() + AUDIT_BREAKER_SECONDS
+            print(
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "service": "facilitator",
+                        "event": "ledger_write_failed",
+                        "status": "degraded",
+                        "droppedEvent": event,
+                        "error": redact_credentials(f"{type(exc).__name__}: {str(exc)[:200]}"),
+                        "note": (
+                            "Audit row not written; the event above is only in this log. "
+                            f"Suppressing audit inserts for {AUDIT_BREAKER_SECONDS}s."
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stdout,
+                flush=True,
+            )
+        else:
+            self._audit_breaker_open_until = 0.0
+
+    def _audit_writes_allowed(self) -> bool:
+        """Whether to attempt an audit insert, or skip it after a recent failure.
+
+        A plain try/except still pays the connection timeout on *every* call,
+        which for a service logging several events per request is most of the
+        latency an outage causes. Once an insert has failed, this stops trying
+        for a short window so the remaining calls are instant.
+
+        Deliberately crude: one timestamp, no half-open probing, no counters.
+        The window is short enough that recovery is picked up on the next
+        event after it lapses, and this is the audit path — a smarter breaker
+        here would be more moving parts guarding something that already
+        degrades safely to stdout.
+        """
+        if self._audit_breaker_open_until == 0.0:
+            return True
+        if time.monotonic() >= self._audit_breaker_open_until:
+            return True
+        return False
 
     def check_connection(self) -> tuple[bool, str]:
         """Whether the ledger is reachable right now.
