@@ -19,6 +19,13 @@ should be able to read a single run and understand the whole protocol without
 running anything themselves — so every step prints what it sent, what came
 back, and why that matters.
 
+**This file is the narration, not the protocol.** The negotiation lives in
+`agent-kit/x402_client.py` — the same walk the MCP server and the Claude agent
+run — and each step below delegates to it. It used to hold its own copy, which
+is precisely how the two would have drifted: a fix applied to one and not the
+other. This project has already been bitten by that once, with a hand-rolled
+SQL splitter that real Postgres caught in CI.
+
 Before any of that, once per identity, the agent registers the public half of
 its Ed25519 keypair with the facilitator. The private half is generated here
 and never sent anywhere — so the facilitator can check this agent's
@@ -37,25 +44,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
-import hmac
-import json
 import os
 import random
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    NoEncryption,
-    PrivateFormat,
-    PublicFormat,
-)
+
+# The negotiation itself lives in agent-kit/x402_client.py — the same walk
+# the MCP server and the Claude agent use. This file is the narration on
+# top of it. Keeping a second copy here is exactly how the two would drift.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-kit"))
+
 from dotenv import load_dotenv
+from x402_client import PaymentRefused as ClientPaymentRefused  # noqa: E402
+from x402_client import X402Client  # noqa: E402
 
 load_dotenv()
 
@@ -68,14 +71,10 @@ DEFAULT_AGENT_ID = os.getenv("AGENT_ID", "agent-perplexity-bot")
 # path never touches this.
 HMAC_SECRET = os.getenv("X402_HMAC_SECRET", "dev-only-shared-secret-change-me")
 
-# Where this agent keeps its private key. One file per agent id, so
-# `--count 8` spreading traffic over several crawler identities gives each a
-# genuinely distinct key rather than one key wearing several names.
-#
-# Gitignored, and that is not a formality: the whole value of the keypair is
-# that this file exists in exactly one place. A private key committed to a
-# repository is a shared secret with extra steps.
-KEY_DIR = Path(os.getenv("AGENT_KEY_DIR", Path(__file__).resolve().parent / ".keys"))
+# Key storage lives in agent-kit/x402_client.py, which owns the keypair now.
+# AGENT_KEY_DIR still selects it — one file per agent id, so `--count 8`
+# spreading traffic over several crawler identities gives each a genuinely
+# distinct key rather than one key wearing several names.
 
 # Crawler identities used by --count when no --agent-id is given, so a simulated
 # day of traffic looks like several different bots rather than one very
@@ -157,62 +156,6 @@ def paise_to_rupees(paise: int | str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The agent's signing key
-# ---------------------------------------------------------------------------
-
-
-def load_or_create_key(agent_id: str) -> tuple[str, str]:
-    """Loads this agent's Ed25519 keypair, generating one on first run.
-
-    Persisted rather than regenerated per process, because the identity has
-    to outlive the run: the facilitator binds `agent_id` to the first key it
-    sees (trust-on-first-use), so an agent that generated a fresh key every
-    time would be refused the second time it registered.
-
-    Args:
-        agent_id: Identity the key belongs to.
-
-    Returns:
-        `(private_key_b64, public_key_b64)`.
-    """
-    KEY_DIR.mkdir(parents=True, exist_ok=True)
-    key_path = KEY_DIR / f"{agent_id}.key"
-
-    if key_path.exists():
-        private = Ed25519PrivateKey.from_private_bytes(
-            base64.b64decode(key_path.read_text().strip())
-        )
-    else:
-        private = Ed25519PrivateKey.generate()
-        raw = private.private_bytes(
-            encoding=Encoding.Raw,
-            format=PrivateFormat.Raw,
-            encryption_algorithm=NoEncryption(),
-        )
-        key_path.write_text(base64.b64encode(raw).decode("ascii"))
-        # Owner-only where the filesystem honours it. A no-op on Windows,
-        # which is why it is not the only thing keeping the key private —
-        # the directory is gitignored regardless.
-        try:
-            key_path.chmod(0o600)
-        except OSError:  # pragma: no cover - platform dependent
-            pass
-
-    private_b64 = base64.b64encode(
-        private.private_bytes(
-            encoding=Encoding.Raw,
-            format=PrivateFormat.Raw,
-            encryption_algorithm=NoEncryption(),
-        )
-    ).decode("ascii")
-    public_b64 = base64.b64encode(
-        private.public_key().public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
-    ).decode("ascii")
-
-    return private_b64, public_b64
-
-
-# ---------------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------------
 
@@ -249,19 +192,23 @@ class X402Agent:
         self.agent_id = agent_id
         self.resource_url = resource_url
         self.facilitator_url = facilitator_url.rstrip("/")
-        self.secret = secret
         self.legacy_hmac = legacy_hmac
         self.verbose = verbose
-        self.client = httpx.Client(timeout=30.0)
-        self.registered = False
 
-        # The private half stays in this process and this process only. The
-        # facilitator never sees it, which is the entire difference between
-        # this and the shared-secret scheme it replaced.
-        if legacy_hmac:
-            self.private_key = self.public_key = None
-        else:
-            self.private_key, self.public_key = load_or_create_key(agent_id)
+        # The negotiation, the keypair, and the signing all live in the shared
+        # client. This class narrates it.
+        #
+        # `budget_paise` is set absurdly high rather than made optional: this
+        # is a demo agent that pays what it is told, and the budget wall is a
+        # headline feature of the client that should not grow an "off" switch
+        # just to accommodate a caller that does not want it.
+        self._x402 = X402Client(
+            agent_id=agent_id,
+            budget_paise=10**12,
+            facilitator_url=self.facilitator_url,
+            legacy_hmac=legacy_hmac,
+            hmac_secret=secret,
+        )
 
     # -- helpers -----------------------------------------------------------
 
@@ -274,27 +221,6 @@ class X402Agent:
         """Prints a numbered step header."""
         self.say(f"\n{bold(f'[{number}/{total}]')} {bold(title)}")
 
-    def sign(self, body: dict) -> str:
-        """Signs the canonical JSON of `body` with this agent's private key.
-
-        Canonical means sorted keys and no incidental whitespace. Both sides
-        must build the identical string or the signature will not match — this
-        is the single most common way a signature scheme goes wrong, which is
-        why the facilitator hands back a `commitmentTemplate` rather than
-        making clients guess.
-
-        Ed25519 by default. Under `--legacy-hmac` this falls back to the old
-        shared-secret MAC, which the facilitator still accepts from agents
-        that have not registered a key.
-        """
-        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
-
-        if self.legacy_hmac:
-            return hmac.new(self.secret.encode(), canonical.encode(), hashlib.sha256).hexdigest()
-
-        private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(self.private_key))
-        return base64.b64encode(private.sign(canonical.encode())).decode("ascii")
-
     def register(self) -> None:
         """Announces this agent's public key to the facilitator, once.
 
@@ -304,40 +230,18 @@ class X402Agent:
         forever, the same way a wallet address is not re-derived per
         transaction.
         """
-        if self.legacy_hmac or self.registered:
+        try:
+            body = self._x402.register(self.facilitator_url)
+        except ClientPaymentRefused as exc:
+            raise PaymentRefused(str(exc)) from exc
+
+        if body is None:
             return
-
-        response = self.client.post(
-            f"{self.facilitator_url}/agents/register",
-            json={
-                "agentId": self.agent_id,
-                "publicKey": self.public_key,
-                "algorithm": "ed25519",
-            },
-        )
-
-        if response.status_code == 409:
-            # This id is bound to a different key — almost always a stale or
-            # deleted local key file against a facilitator that still
-            # remembers the old one. Say so plainly rather than failing later
-            # with a confusing invalid_signature at settlement time.
-            raise PaymentRefused(
-                f"{self.agent_id} is registered with a different public key. "
-                f"Delete {KEY_DIR / f'{self.agent_id}.key'} to start over with a fresh "
-                "identity, or use --agent-id to pick a different one."
-            )
-        if response.status_code != 200:
-            raise PaymentRefused(f"key registration failed: {response.text[:300]}")
-
-        self.registered = True
-        body = response.json()
 
         self.say()
         self.say(dim(f"  key   {self.agent_id}"))
-        self.say(
-            dim(f"        public  {self.public_key[:24]}…  "
-                f"({'registered now' if body.get('created') else 'already on file'})")
-        )
+        created = "registered now" if body.get("created") else "already on file"
+        self.say(dim(f"        public  {self._x402.public_key[:24]}…  ({created})"))
         self.say(dim("        private key never leaves this process — the facilitator"))
         self.say(dim("        holds only the public half and cannot forge a commitment."))
 
@@ -347,7 +251,8 @@ class X402Agent:
         """Step 1: ask for the resource without paying, and read the price.
 
         Returns:
-            The decoded x402 `PaymentRequired` object.
+            The client's quote dict, carrying the decoded 402 and the
+            requirements the rest of the walk needs.
 
         Raises:
             PaymentRefused: If the server did not answer with a 402.
@@ -355,28 +260,17 @@ class X402Agent:
         self.step(1, 5, "Request the resource with no payment attached")
         self.say(dim(f"      GET {self.resource_url}"))
 
-        response = self.client.get(self.resource_url)
-
-        if response.status_code == 200:
-            self.say(yellow("      This resource is not paywalled — nothing to pay for."))
-            raise PaymentRefused("resource was served without payment")
-
-        if response.status_code != 402:
-            raise PaymentRefused(
-                f"expected HTTP 402, got {response.status_code}: {response.text[:200]}"
-            )
+        try:
+            quoted = self._x402.quote_url(self.resource_url)
+        except ClientPaymentRefused as exc:
+            if "not paywalled" in str(exc):
+                self.say(yellow("      This resource is not paywalled — nothing to pay for."))
+                raise PaymentRefused("resource was served without payment") from exc
+            raise PaymentRefused(str(exc)) from exc
 
         self.say(f"      {ARROW} {yellow('HTTP 402 Payment Required')}")
 
-        # The machine-readable offer travels base64-encoded in a header. The
-        # response body is whatever the publisher wants it to be.
-        header = response.headers.get("payment-required")
-        if not header:
-            raise PaymentRefused("402 carried no PAYMENT-REQUIRED header — cannot pay blind")
-
-        required = json.loads(base64.b64decode(header))
-        offer = required["accepts"][0]
-
+        offer = quoted["requirements"]
         self.say()
         self.say(dim("      accepts[0], decoded from the PAYMENT-REQUIRED header:"))
 
@@ -400,44 +294,27 @@ class X402Agent:
             "batched, not per-request",
         )
 
-        return required
+        return quoted
 
-    def get_quote(self, offer_requirements: dict) -> dict:
+    def get_quote(self, quoted: dict) -> dict:
         """Step 2: ask the facilitator to quote this fetch.
-
-        Args:
-            offer_requirements: The `accepts[0]` entry from the 402.
 
         Returns:
             The facilitator's quote response.
         """
-        facilitator = offer_requirements["extra"].get("facilitatorUrl", self.facilitator_url)
-        endpoint = f"{facilitator.rstrip('/')}/offer"
+        endpoint = f"{self._x402.facilitator_for(quoted)}/offer"
 
         self.step(2, 5, "Ask the facilitator to quote this fetch")
         self.say(dim(f"      POST {endpoint}"))
         self.say(dim("      An agent paying in USDC would skip this — it holds a wallet and"))
         self.say(dim("      signs a transfer itself. Paying in rupees, it has to be quoted."))
 
-        response = self.client.post(
-            endpoint,
-            json={
-                "agentId": self.agent_id,
-                "resourceId": self._resource_id(offer_requirements),
-                "amountPaise": int(offer_requirements["amount"]),
-                "payTo": offer_requirements["payTo"],
-                "scheme": offer_requirements["scheme"],
-                "network": offer_requirements["network"],
-                "resourceUrl": self.resource_url,
-            },
-        )
+        try:
+            quote = self._x402.request_offer(quoted)
+        except ClientPaymentRefused as exc:
+            raise PaymentRefused(str(exc)) from exc
 
-        if response.status_code != 200:
-            raise PaymentRefused(f"facilitator refused to quote: {response.text[:300]}")
-
-        quote = response.json()
         offer = quote["offer"]
-
         self.say(f"      {ARROW} {green(offer['offerId'])}  ({quote['humanAmount']})")
         self.say(dim(f"        issued {offer['issuedAt']}, expires {offer['expiresAt']}"))
         self.say(dim("        single-use, and bound to this agent id"))
@@ -448,23 +325,16 @@ class X402Agent:
         """Step 3: sign acceptance of the quote.
 
         Returns:
-            The x402 payment payload the publisher will forward for verification.
+            The signed payload the publisher will forward for verification.
         """
         self.step(3, 5, "Sign acceptance of the quote")
 
-        accepted_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-        # The facilitator handed back the exact object to sign, with acceptedAt
-        # left as a placeholder. Filling in a template beats reconstructing the
-        # field set from documentation and getting one key wrong.
-        commitment = dict(quote["commitmentTemplate"])
-        commitment["acceptedAt"] = accepted_at
-
-        signature = self.sign(commitment)
+        signed = self._x402.sign_acceptance(quote)
+        signature = signed["signature"]
+        preview = signed["canonicalJson"]
 
         algorithm = "HMAC-SHA256" if self.legacy_hmac else "Ed25519"
         self.say(dim(f"      {algorithm} over the canonical JSON of:"))
-        preview = json.dumps(commitment, sort_keys=True, separators=(",", ":"))
         self.say(dim(f"        {preview[:88]}…" if len(preview) > 88 else f"        {preview}"))
         length = dim(f"({len(signature)} chars)")
         self.say(f"      {ARROW} {green(signature[:32])}{dim('…')}  {length}")
@@ -479,14 +349,9 @@ class X402Agent:
             self.say(dim("      can verify this and cannot produce it — so the commitment"))
             self.say(dim("      is evidence in a dispute, not just a checksum."))
 
-        return {
-            "offerId": quote["offer"]["offerId"],
-            "agentId": self.agent_id,
-            "acceptedAt": accepted_at,
-            "agentSignature": signature,
-        }
+        return signed
 
-    def request_paid(self, required: dict, payload: dict) -> httpx.Response:
+    def request_paid(self, quoted: dict, signed: dict) -> httpx.Response:
         """Step 4: retry the original request with the payment proof attached.
 
         Returns:
@@ -494,30 +359,22 @@ class X402Agent:
         """
         self.step(4, 5, "Retry the request with the payment attached")
 
-        envelope = {
-            "x402Version": required["x402Version"],
-            "accepted": required["accepts"][0],
-            "payload": payload,
-        }
-        header = base64.b64encode(json.dumps(envelope).encode()).decode()
+        header = self._x402.payment_header(quoted, signed["payload"])
 
         self.say(dim(f"      GET {self.resource_url}"))
         self.say(dim(f"      X-PAYMENT: {header[:56]}…  ({len(header)} bytes of base64)"))
 
-        response = self.client.get(self.resource_url, headers={"X-PAYMENT": header})
+        try:
+            response = self._x402.request_paid(quoted, header)
+        except ClientPaymentRefused as exc:
+            # Payment was presented and refused. The client surfaces the reason
+            # the publisher put in its retry header, so show that rather than a
+            # bare status code.
+            self.say(f"      {ARROW} {red('HTTP 402')} — {exc}")
+            raise PaymentRefused(str(exc)) from exc
 
-        if response.status_code == 200:
-            self.say(f"      {ARROW} {green('HTTP 200 OK')}")
-            return response
-
-        # Payment was presented and refused. The reason is in the header the
-        # publisher sent back, so report it rather than a bare status code.
-        reason = "unknown"
-        retry_header = response.headers.get("payment-required")
-        if retry_header:
-            reason = json.loads(base64.b64decode(retry_header)).get("error", "unknown")
-        self.say(f"      {ARROW} {red(f'HTTP {response.status_code}')} — {reason}")
-        raise PaymentRefused(reason)
+        self.say(f"      {ARROW} {green('HTTP 200 OK')}")
+        return response
 
     def read_receipt(self, response: httpx.Response) -> dict | None:
         """Step 5: read the settlement receipt.
@@ -527,16 +384,12 @@ class X402Agent:
         """
         self.step(5, 5, "Read the settlement receipt")
 
-        raw = response.headers.get("payment-response") or response.headers.get(
-            "x-payment-response"
-        )
-        if not raw:
+        receipt = self._x402.read_receipt(response)
+        if not receipt:
             self.say(dim("      No receipt header — the publisher did not report settlement."))
             return None
 
-        receipt = json.loads(base64.b64decode(raw))
         extra = receipt.get("extra", {})
-
         self.say(dim("      decoded from the PAYMENT-RESPONSE header:"))
         self.say(f"        success       {green(str(receipt.get('success')))}")
         self.say(f"        transaction   {cyan(receipt.get('transaction', '—'))}")
@@ -564,16 +417,14 @@ class X402Agent:
         # One-time identity setup, not part of the negotiation.
         self.register()
 
-        required = self.request_unpaid()
-        requirements = required["accepts"][0]
-
-        quote = self.get_quote(requirements)
-        payload = self.sign_acceptance(quote)
-        response = self.request_paid(required, payload)
+        quoted = self.request_unpaid()
+        quote = self.get_quote(quoted)
+        signed = self.sign_acceptance(quote)
+        response = self.request_paid(quoted, signed)
         receipt = self.read_receipt(response)
 
         content = response.json()
-        amount = int(requirements["amount"])
+        amount = quoted["amountPaise"]
 
         if self.verbose:
             self._print_content(content)
@@ -624,7 +475,8 @@ class X402Agent:
         print()
 
     def close(self) -> None:
-        self.client.close()
+        """Releases the shared client's HTTP connections."""
+        self._x402.close()
 
 
 def _wrap(text: str, width: int) -> list[str]:

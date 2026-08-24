@@ -38,6 +38,8 @@ agent's good intentions.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 from dataclasses import dataclass, field
@@ -60,6 +62,9 @@ DEFAULT_FACILITATOR = os.getenv("FACILITATOR_URL", "http://localhost:8402")
 # private half of the keypair is the one thing in this project that must exist
 # in exactly one place.
 KEY_DIR = Path(os.getenv("AGENT_KEY_DIR", Path(__file__).resolve().parent / ".keys"))
+
+# Only used by `legacy_hmac`. The normal path never touches it.
+DEFAULT_HMAC_SECRET = os.getenv("X402_HMAC_SECRET", "dev-only-shared-secret-change-me")
 
 
 class PaymentRefused(Exception):
@@ -105,6 +110,12 @@ class X402Client:
     resource_base: str = DEFAULT_RESOURCE_BASE
     facilitator_url: str = DEFAULT_FACILITATOR
     timeout: float = 30.0
+    # Sign with the pre-keypair shared secret instead of this agent's own
+    # key. Exists so the downgrade path the facilitator still accepts from
+    # unregistered agents can be exercised and seen. Registration is
+    # skipped under it — a legacy agent has no key to register.
+    legacy_hmac: bool = False
+    hmac_secret: str = DEFAULT_HMAC_SECRET
 
     spent_paise: int = field(default=0, init=False)
     purchases: list[Purchase] = field(default_factory=list, init=False)
@@ -114,7 +125,11 @@ class X402Client:
         self.facilitator_url = self.facilitator_url.rstrip("/")
         self._http = httpx.Client(timeout=self.timeout)
         self._registered = False
-        self._private_key, self.public_key = self._load_or_create_key()
+        if self.legacy_hmac:
+            # No keypair to make, and nothing to register.
+            self._private_key = self.public_key = None
+        else:
+            self._private_key, self.public_key = self._load_or_create_key()
 
     # -- identity ----------------------------------------------------------
 
@@ -157,10 +172,18 @@ class X402Client:
         ).decode("ascii")
         return private_b64, public_b64
 
-    def register(self, facilitator: str | None = None) -> None:
-        """Announces this agent's public key to the facilitator, once."""
-        if self._registered:
-            return
+    def register(self, facilitator: str | None = None) -> dict | None:
+        """Announces this agent's public key to the facilitator, once.
+
+        Returns:
+            The facilitator's registration record, or None when there was
+            nothing to do — already registered this run, or signing with the
+            legacy shared secret, which has no key to announce. Returned
+            rather than discarded so a caller that narrates itself can say
+            whether the key was new or already on file.
+        """
+        if self._registered or self.legacy_hmac:
+            return None
 
         base = (facilitator or self.facilitator_url).rstrip("/")
         response = self._http.post(
@@ -180,10 +203,24 @@ class X402Client:
             raise PaymentRefused(f"key registration failed: {response.text[:300]}")
 
         self._registered = True
+        return response.json()
 
     def _sign(self, body: dict) -> str:
-        """Ed25519 over the canonical JSON of `body`."""
+        """Signs the canonical JSON of `body`.
+
+        Ed25519 normally. Under `legacy_hmac` this falls back to the
+        shared-secret MAC the facilitator still accepts from agents with no
+        registered key — supported here rather than only in the CLI agent
+        because the facilitator accepts both, and a client library for it that
+        could only speak one would be an incomplete client.
+        """
         canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+        if self.legacy_hmac:
+            return hmac.new(
+                self.hmac_secret.encode(), canonical.encode(), hashlib.sha256
+            ).hexdigest()
+
         private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(self._private_key))
         return base64.b64encode(private.sign(canonical.encode())).decode("ascii")
 
@@ -214,7 +251,17 @@ class X402Client:
             `{resource, path, amountPaise, humanAmount, preview, requirements}`.
         """
         path = self._path_for(resource)
-        url = f"{self.resource_base}{path}"
+        return self.quote_url(f"{self.resource_base}{path}", resource=resource, path=path)
+
+    def quote_url(self, url: str, *, resource: str | None = None, path: str | None = None) -> dict:
+        """The same, for a resource named by URL rather than by key.
+
+        Split out because a caller may already know the exact URL and have no
+        reason to look it up — `demo-agent/crawler_agent.py --url` takes one
+        directly, and resolving it back through the publisher's listing would
+        fail for any URL that listing does not mention.
+        """
+        resource = resource or url.rstrip("/").rsplit("/", 1)[-1]
 
         response = self._http.get(url, headers={"Accept": "application/json"})
         if response.status_code == 200:
@@ -236,7 +283,7 @@ class X402Client:
 
         return {
             "resource": resource,
-            "path": path,
+            "path": path if path is not None else url,
             "url": url,
             "amountPaise": int(requirements["amount"]),
             "humanAmount": requirements.get("extra", {}).get("humanAmount"),
@@ -249,86 +296,161 @@ class X402Client:
         """Budget left, in paise."""
         return max(self.budget_paise - self.spent_paise, 0)
 
-    def pay_and_fetch(self, resource: str) -> Purchase:
-        """Buys a resource, if the budget allows it.
+    def check_budget(self, resource: str, amount_paise: int) -> None:
+        """The wall. Raises before anything is spent.
+
+        Called before the offer is even requested, so a refusal leaves no
+        consumed offer and no ledger row behind.
 
         Raises:
             BudgetExceeded: If the price would take total spend over budget.
-                Checked before any payment call, so a refused purchase costs
-                nothing and books nothing.
-            PaymentRefused: If the publisher would not serve it.
         """
-        quoted = self.quote(resource)
-        amount = quoted["amountPaise"]
-
-        # The wall. Deliberately before the offer is even requested, so a
-        # refusal leaves no consumed offer and no ledger row behind.
-        if amount > self.remaining_paise():
+        if amount_paise > self.remaining_paise():
             raise BudgetExceeded(
-                f"{resource} costs {_rupees(amount)} but only "
+                f"{resource} costs {_rupees(amount_paise)} but only "
                 f"{_rupees(self.remaining_paise())} of the "
                 f"{_rupees(self.budget_paise)} budget is left."
             )
 
+    def facilitator_for(self, quoted: dict) -> str:
+        """The facilitator the *publisher* nominated, from its own 402.
+
+        Falling back to the configured URL only when the 402 does not say. An
+        x402 client is supposed to learn where to pay from the resource it is
+        buying — the publisher chooses who settles its payments, not the
+        client — so the configured value is a fallback, not the default.
+        """
+        extra = quoted["requirements"].get("extra", {})
+        return extra.get("facilitatorUrl", self.facilitator_url).rstrip("/")
+
+    def request_offer(self, quoted: dict) -> dict:
+        """Asks the facilitator to quote this fetch, and registers if needed.
+
+        Returns:
+            The facilitator's `{offer, signature, commitmentTemplate, ...}`.
+        """
         requirements = quoted["requirements"]
-        facilitator = requirements.get("extra", {}).get("facilitatorUrl", self.facilitator_url)
+        facilitator = self.facilitator_for(quoted)
         self.register(facilitator)
 
-        offer_response = self._http.post(
-            f"{facilitator.rstrip('/')}/offer",
+        response = self._http.post(
+            f"{facilitator}/offer",
             json={
                 "agentId": self.agent_id,
-                "resourceId": requirements.get("extra", {}).get("resourceId") or resource,
-                "amountPaise": amount,
+                "resourceId": (
+                    requirements.get("extra", {}).get("resourceId") or quoted["resource"]
+                ),
+                "amountPaise": quoted["amountPaise"],
                 "payTo": requirements["payTo"],
                 "scheme": requirements["scheme"],
                 "network": requirements["network"],
                 "resourceUrl": quoted["url"],
             },
         )
-        if offer_response.status_code != 200:
-            raise PaymentRefused(f"facilitator refused to quote: {offer_response.text[:300]}")
-        offer = offer_response.json()
+        if response.status_code != 200:
+            raise PaymentRefused(f"facilitator refused to quote: {response.text[:300]}")
+        return response.json()
 
+    def sign_acceptance(self, offer: dict) -> dict:
+        """Signs acceptance of a quote.
+
+        The facilitator hands back the exact object to sign as
+        `commitmentTemplate`, with `acceptedAt` left as a placeholder. Filling
+        in a template beats reconstructing the field set from documentation
+        and getting one key wrong — which is the most common way a signature
+        scheme fails in practice.
+
+        Returns:
+            `{"payload", "canonicalJson", "signature", "acceptedAt"}`. The
+            canonical form is returned rather than kept private because a
+            client that narrates itself needs to show exactly what was signed.
+        """
         accepted_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         commitment = dict(offer["commitmentTemplate"])
         commitment["acceptedAt"] = accepted_at
 
-        envelope = {
-            "x402Version": quoted["required"]["x402Version"],
-            "accepted": requirements,
+        signature = self._sign(commitment)
+        return {
             "payload": {
                 "offerId": offer["offer"]["offerId"],
                 "agentId": self.agent_id,
                 "acceptedAt": accepted_at,
-                "agentSignature": self._sign(commitment),
+                "agentSignature": signature,
             },
+            "canonicalJson": json.dumps(commitment, sort_keys=True, separators=(",", ":")),
+            "signature": signature,
+            "acceptedAt": accepted_at,
         }
-        header = base64.b64encode(json.dumps(envelope).encode()).decode()
 
-        paid = self._http.get(
+    def payment_header(self, quoted: dict, payload: dict) -> str:
+        """Base64 of the x402 payment envelope, for the X-PAYMENT header."""
+        envelope = {
+            "x402Version": quoted["required"]["x402Version"],
+            "accepted": quoted["requirements"],
+            "payload": payload,
+        }
+        return base64.b64encode(json.dumps(envelope).encode()).decode()
+
+    def request_paid(self, quoted: dict, header: str) -> httpx.Response:
+        """Retries the original request with the payment attached."""
+        response = self._http.get(
             quoted["url"], headers={"X-PAYMENT": header, "Accept": "application/json"}
         )
-        if paid.status_code != 200:
-            raise PaymentRefused(
-                f"payment presented and refused: HTTP {paid.status_code} {paid.text[:200]}"
-            )
+        if response.status_code != 200:
+            reason = "unknown"
+            retry_header = response.headers.get("payment-required")
+            if retry_header:
+                reason = json.loads(base64.b64decode(retry_header)).get("error", "unknown")
+            raise PaymentRefused(reason)
+        return response
 
-        receipt_header = paid.headers.get("payment-response") or paid.headers.get(
+    @staticmethod
+    def read_receipt(response: httpx.Response) -> dict:
+        """Decodes the settlement receipt, under either header name."""
+        raw = response.headers.get("payment-response") or response.headers.get(
             "x-payment-response"
         )
-        receipt = json.loads(base64.b64decode(receipt_header)) if receipt_header else {}
+        return json.loads(base64.b64decode(raw)) if raw else {}
 
+    def record_purchase(self, resource: str, amount_paise: int, receipt: dict, content: dict):
+        """Books a completed purchase against the budget.
+
+        Separate from `request_paid` so spend is only counted once the
+        publisher has actually served the content — a request that failed
+        after payment was presented has not cost the agent its budget.
+        """
         purchase = Purchase(
             resource=resource,
-            amount_paise=amount,
+            amount_paise=amount_paise,
             commitment_id=receipt.get("transaction", ""),
-            content=paid.json(),
+            content=content,
         )
-        # Only counted once the publisher has actually served the content.
-        self.spent_paise += amount
+        self.spent_paise += amount_paise
         self.purchases.append(purchase)
         return purchase
+
+    def pay_and_fetch(self, resource: str) -> Purchase:
+        """Buys a resource, if the budget allows it.
+
+        The whole negotiation, composed from the steps above. A caller that
+        wants to narrate each step — `demo-agent/crawler_agent.py` — calls
+        them individually instead; this is the same walk with nothing between
+        the steps.
+
+        Raises:
+            BudgetExceeded: If the price would take total spend over budget.
+            PaymentRefused: If the publisher would not serve it.
+        """
+        quoted = self.quote(resource)
+        self.check_budget(resource, quoted["amountPaise"])
+
+        offer = self.request_offer(quoted)
+        signed = self.sign_acceptance(offer)
+        paid = self.request_paid(quoted, self.payment_header(quoted, signed["payload"]))
+
+        return self.record_purchase(
+            resource, quoted["amountPaise"], self.read_receipt(paid), paid.json()
+        )
 
     # -- reporting ---------------------------------------------------------
 
