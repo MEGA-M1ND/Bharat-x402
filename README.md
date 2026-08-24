@@ -15,7 +15,7 @@ whole negotiation yourself, no install.
 | Razorpay charges that took | **5** — one Payment Link per agent, 55 gateway calls avoided |
 | Revenue **impossible** to collect per-request | **₹30.00 of ₹30.00** — every charge under Razorpay's ₹1.00 floor |
 | Razorpay's ₹1 floor | verified by posting 50 paise to the live test API, not read off a doc |
-| Tests | **188** — 178 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
+| Tests | **217** — 207 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
 
 ```
       key   agent-perplexity-bot
@@ -68,10 +68,12 @@ These solve *different layers of the same problem*, and they compose:
 | Authority | How is the agent allowed to spend the user's money at all? | ✗ out of scope | ✅ consent + limits |
 | Settlement | How do rupees actually move? | pluggable | ✅ the rail |
 
-This project implements the **negotiation** layer and settles it through Payment Links because
-Reserve Pay is in closed beta. `razorpay_client.py` is the only file that would change to sit on
-Reserve Pay instead — the commitment ledger is indifferent to what settles it. That substitution
-is the single most valuable thing this repo argues is possible.
+This project implements the **negotiation** layer, and settles it through Payment Links by
+default because Reserve Pay is in closed beta. A simulated Reserve Pay instrument is built and
+switchable (`SETTLEMENT_INSTRUMENT=reserve_pay`) precisely so the "the ledger doesn't care what
+settles it" claim is checkable rather than asserted — [what the swap actually
+cost](#4-the-swap-the-settlement-rail-claim-actually-tested) is written up below, including the
+part the original claim got wrong.
 
 The adjacent surfaces this would plug into: Razorpay's [official MCP
 server](https://github.com/razorpay/razorpay-mcp-server) already exposes `create_payment_link`
@@ -229,7 +231,7 @@ advice; the client is the wall.
 
 ---
 
-## Four things this gets right that a demo usually doesn't
+## Five things this gets right that a demo usually doesn't
 
 ### 1. The agent signs with a key the facilitator does not have
 
@@ -329,7 +331,38 @@ service has no authentication, so `POST /agents/{id}/freeze` would let any calle
 any agent — turning a safety control into a denial-of-service primitive. That is strictly
 worse than having no endpoint.
 
-### 4. The double-charge guarantee is enforced by the database
+### 4. The "swap the settlement rail" claim, actually tested
+
+This README used to claim the commitment ledger is indifferent to what settles it, and that
+moving from Payment Links to **UPI Reserve Pay** — Razorpay's own rail for agentic payments —
+would touch one file. Claims like that are free to make, so it's now built:
+
+```bash
+SETTLEMENT_INSTRUMENT=reserve_pay   # a simulated mandate debit, not a hosted page
+```
+
+The claim was close, not exact. In full it cost: [`reserve_pay.py`](facilitator/reserve_pay.py);
+an instrument-agnostic `create_charge` in `razorpay_client.py`; **two call sites renamed** in
+`main.py` (`create_payment_link` → `create_charge` — keeping the old name would mean a method
+called `create_payment_link` returning a mandate debit); and **one nullable column**, because a
+Reserve Pay debit and a *failed* Payment Link both have a null URL and are otherwise
+indistinguishable in the ledger.
+
+Nothing in the commitment lifecycle, the batching, or the webhook intake moved. A test runs the
+same traffic through both instruments and asserts the commitment side of the ledger comes out
+identical — if that ever fails, the seam has stopped being a seam.
+
+**What Reserve Pay does *not* fix, despite the temptation to say otherwise:** the ₹1.00 gateway
+minimum. A debit is still a UPI payment instruction. What it removes is the *checkout page* —
+the barrier that made a hosted link absurd in the path of a machine-to-machine request. So it
+fixes the instrument and leaves the economics that make batching necessary exactly where they
+were. Both are needed, which is why it settles a batch rather than replacing batching.
+
+It refuses to run outside `MOCK_RAZORPAY`: it's a simulation with fabricated identifiers, and a
+service holding real credentials that reports fake debits as settlements is worse than one that
+won't start.
+
+### 5. The double-charge guarantee is enforced by the database
 
 An offer becomes a commitment through a single conditional `UPDATE ... WHERE status = 'open'`,
 so only one of two concurrent settlements can win — with a `UNIQUE(offer_id)` constraint behind
@@ -407,11 +440,11 @@ The full breakdown, including where fixed fees *do* multiply, is in
 | `demo-agent/` | A crawler that holds its own keypair and narrates the whole negotiation as it pays |
 | `agent-kit/` | **The agent surface.** `x402_client.py` (the negotiation + the budget wall), `tools.py` (the five tools, defined once), `mcp_server.py` (MCP), `researcher.py` (a Claude agent that decides what to buy) |
 | `reporting/` | The publisher's daily revenue digest, formatted as a WhatsApp message |
-| `tests/` | 188 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall), `test_ledger_degradation.py` (behaviour when the ledger is down), `test_spend_limits.py` (the caps) |
+| `tests/` | 217 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall), `test_ledger_degradation.py` (behaviour when the ledger is down), `test_spend_limits.py` (the caps), `test_reserve_pay.py`, `test_researcher.py` |
 | `docs/` | [Architecture](docs/architecture.md) · [Demo script](docs/demo-script.md) |
 
 ```bash
-pytest tests -v                                     # 188 tests
+pytest tests -v                                     # 217 tests
 TEST_LEDGER_DSN=postgres://… pytest tests -q        # the same suite, on real Postgres
 ```
 
@@ -450,12 +483,11 @@ Every simplification is listed with what production would change in
 
 ## Where this would go next
 
-1. **Settle on UPI Reserve Pay instead of Payment Links.** The correct fix for the one remaining
-   awkwardness in this design — a hosted checkout page cannot sit in the path of a request an
-   agent makes 10,000 times a day, and a blocked-funds mandate with spend limits removes it
-   entirely. `razorpay_client.py` is the only file that changes.
-2. **Expose the facilitator over MCP.** `/economics`, `/ledger/summary`, and `/settle-batch` are
-   already the right shape for tools, and Razorpay's own MCP server is the precedent.
+1. **A real UPI Reserve Pay integration.** The simulated one is built (see above); the real
+   thing needs closed-beta access. That swap is the last genuine gap between this and
+   something a publisher could run.
+2. **Expose the facilitator over MCP** — done for the *agent* side (`agent-kit/mcp_server.py`);
+   the publisher's own `/economics` and `/settle-batch` would be the operator-facing half.
 3. **Real x402 interop** — advertise both `razorpay-inr` and USDC-on-Base in `accepts[]` and let
    the agent pick its rail. The `accepts` array is a list for exactly this reason.
 4. **Ship it as a facilitator service** — every publisher who wants this needs the same ledger,

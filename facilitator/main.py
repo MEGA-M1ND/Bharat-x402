@@ -406,6 +406,9 @@ def supported() -> dict:
                     "decimals": 2,  # amounts travel as integer paise
                     "settlementRail": "razorpay",
                     "settlementMode": SETTLEMENT_MODE,
+                    # payment_link | reserve_pay. A client that cares whether
+                    # settlement involves a page a human opens can see it here.
+                    "settlementInstrument": gateway.instrument,
                     "razorpayMode": gateway.mode,
                     # Named honestly: this is not the EVM signature scheme,
                     # but it is now a real asymmetric one — the agent signs
@@ -808,12 +811,15 @@ def _settle_immediately(commitment: dict) -> JSONResponse:
     """
     batch_id = f"batch_{uuid.uuid4().hex[:16]}"
     try:
-        link = gateway.create_payment_link(
+        link = gateway.create_charge(
             amount_paise=commitment["amountPaise"],
             description=f"x402 request: {commitment['resourceId']}",
             reference_id=batch_id,
             agent_id=commitment["agentId"],
             notes={"commitment_id": commitment["commitmentId"], "mode": "per_request"},
+            already_debited_paise=ledger.debited_today(
+                agent_id=commitment["agentId"], settle_date=commitment["settleDate"]
+            ),
         )
     except (RazorpayConfigError, Exception) as exc:  # noqa: BLE001 - reported, never swallowed
         ledger.record_batch(
@@ -857,6 +863,12 @@ def _settle_immediately(commitment: dict) -> JSONResponse:
         payment_link_url=link.get("short_url"),
         status="created",
         razorpay_mode=gateway.mode,
+        instrument=link.get("instrument", "payment_link"),
+        # A mandate debit has already taken the money; a Payment Link has not,
+        # and waits for its webhook. See Ledger.record_batch.
+        amount_paid_paise=(
+            commitment["amountPaise"] if link.get("status") == "captured" else None
+        ),
     )
     ledger.log_event(
         "per_request_settled",
@@ -1106,7 +1118,10 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
         )
 
         try:
-            link = gateway.create_payment_link(
+            # Instrument-agnostic: this becomes a hosted Payment Link or a UPI
+            # Reserve Pay mandate debit depending on SETTLEMENT_INSTRUMENT, and
+            # nothing here needs to know which. See razorpay_client.create_charge.
+            link = gateway.create_charge(
                 amount_paise=total,
                 description=description,
                 reference_id=batch_id,
@@ -1115,6 +1130,12 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
                     "settle_date": settle_date,
                     "commitments": str(len(commitment_ids)),
                 },
+                # A mandate is drawn down across the day, so a debit needs to
+                # know what has already been taken. Reads the ledger rather
+                # than a tally kept in the gateway, which could disagree with it.
+                already_debited_paise=ledger.debited_today(
+                    agent_id=agent_id, settle_date=settle_date
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - recorded and reported, never swallowed
             ledger.record_batch(
@@ -1166,6 +1187,8 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
             payment_link_url=link.get("short_url"),
             status="created",
             razorpay_mode=gateway.mode,
+            instrument=link.get("instrument", "payment_link"),
+            amount_paid_paise=(total if link.get("status") == "captured" else None),
         )
         ledger.log_event(
             "batch_settled",
@@ -1320,6 +1343,7 @@ def health() -> JSONResponse:
             "detail": redact_credentials(ledger_detail),
         },
         "webhooksConfigured": bool(RAZORPAY_WEBHOOK_SECRET),
+        "settlementInstrument": gateway.instrument,
         "proofScheme": ALGORITHM,
         "hmacFallbackAllowed": ALLOW_HMAC_FALLBACK,
     }
