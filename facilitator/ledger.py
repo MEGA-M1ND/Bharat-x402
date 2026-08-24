@@ -223,7 +223,13 @@ CREATE TABLE IF NOT EXISTS batches (
     -- link. Null until Razorpay confirms payment.
     paid_at             TEXT,
     amount_paid_paise   INTEGER,
-    razorpay_payment_id TEXT
+    razorpay_payment_id TEXT,
+    -- payment_link | reserve_pay. Which instrument settled this batch.
+    --
+    -- Earns its place: a Reserve Pay debit has no URL, and neither does a
+    -- *failed* Payment Link, so without this the two are indistinguishable
+    -- in the ledger. See reserve_pay.py.
+    instrument          TEXT NOT NULL DEFAULT 'payment_link'
 );
 
 CREATE TABLE IF NOT EXISTS commitments (
@@ -840,19 +846,41 @@ class Ledger:
         status: str,
         razorpay_mode: str,
         error_message: str | None = None,
+        instrument: str = "payment_link",
+        amount_paid_paise: int | None = None,
     ) -> None:
         """Writes the batch and marks its commitments settled, in one transaction.
 
         If the Razorpay call failed, the commitments stay `pending` so the next
         run picks them up again — a failed charge must never look like a paid
         one.
+
+        Args:
+            instrument: What settled it — "payment_link" or "reserve_pay".
+            amount_paid_paise: Set only when the instrument settles inline. A
+                Payment Link leaves this None until its webhook lands, because
+                a created link is an invoice; a mandate debit has already
+                taken the money by the time it returns, and there is no
+                webhook to wait for. Passing it is what lets `collectedPaise`
+                stay meaningful across both instruments.
         """
+        settled_inline = amount_paid_paise is not None
+        paid_at = utc_now() if settled_inline else None
+
+        # An instrument that takes the money as it goes is `paid`, not
+        # `created`. Skipping this would leave the batch carrying an
+        # `amount_paid_paise` that `daily_summary` never counts, because that
+        # query filters on `status = 'paid'` — so collected revenue would read
+        # as zero while the money had genuinely arrived.
+        stored_status = "paid" if settled_inline and status == "created" else status
+
         with _WRITE_LOCK, self._connect() as conn:
             conn.execute(
                 "INSERT INTO batches (batch_id, agent_id, settle_date, created_at,"
                 " commitment_count, total_paise, payment_link_id, payment_link_url,"
-                " status, razorpay_mode, error_message)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " status, razorpay_mode, error_message, instrument, amount_paid_paise,"
+                " paid_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     agent_id,
@@ -862,9 +890,12 @@ class Ledger:
                     int(total_paise),
                     payment_link_id,
                     payment_link_url,
-                    status,
+                    stored_status,
                     razorpay_mode,
                     error_message,
+                    instrument,
+                    amount_paid_paise,
+                    paid_at,
                 ),
             )
 
@@ -880,6 +911,26 @@ class Ledger:
                     "UPDATE commitments SET status = 'pending' WHERE commitment_id = ?",
                     [(cid,) for cid in commitment_ids],
                 )
+
+    def debited_today(self, *, agent_id: str, settle_date: str | None = None) -> int:
+        """What an agent's UPI Reserve Pay mandate has been drawn down by.
+
+        A mandate authorises a block and is debited against repeatedly, so a
+        debit needs to know what is left. That comes from here rather than a
+        counter held in the gateway object, which on a serverless deployment
+        would reset on every cold start and let the same block be spent twice.
+
+        Counts only `reserve_pay` batches: a Payment Link draws on nothing.
+        """
+        settle_date = settle_date or today_utc()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(total_paise), 0) AS total FROM batches"
+                " WHERE agent_id = ? AND settle_date = ? AND instrument = 'reserve_pay'"
+                " AND status <> 'failed'",
+                (agent_id, settle_date),
+            ).fetchone()
+        return int(row["total"])
 
     def get_batch(self, batch_id: str) -> Mapping[str, Any] | None:
         """Looks up one batch, or None."""

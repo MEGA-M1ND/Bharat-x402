@@ -74,7 +74,13 @@ CREATE TABLE IF NOT EXISTS batches (
     -- link. Null until Razorpay confirms payment.
     paid_at             TEXT,
     amount_paid_paise   INTEGER,
-    razorpay_payment_id TEXT
+    razorpay_payment_id TEXT,
+    -- payment_link | reserve_pay. Which instrument settled this batch.
+    --
+    -- Earns its place: a Reserve Pay debit has no URL, and neither does a
+    -- *failed* Payment Link, so without this the two are indistinguishable
+    -- in the ledger. See reserve_pay.py.
+    instrument          TEXT NOT NULL DEFAULT 'payment_link'
 );
 
 CREATE TABLE IF NOT EXISTS commitments (

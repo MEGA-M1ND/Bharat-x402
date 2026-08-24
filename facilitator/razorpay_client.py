@@ -48,6 +48,7 @@ import time
 from dataclasses import dataclass
 
 import razorpay
+from reserve_pay import MockReservePay
 
 
 class RazorpayConfigError(Exception):
@@ -234,6 +235,28 @@ class RazorpayGateway:
         self.key_id = key_id
         self._client = None
 
+        # Which settlement instrument a batch becomes. See `create_charge`.
+        #
+        # Reserve Pay is refused outside mock mode on purpose: it is a
+        # simulation with fabricated identifiers, and a service holding real
+        # test-mode credentials that reports fake debits as settlements is
+        # worse than one that refuses to start.
+        self.instrument = (os.getenv("SETTLEMENT_INSTRUMENT") or "payment_link").strip().lower()
+        if self.instrument not in ("payment_link", "reserve_pay"):
+            raise RazorpayConfigError(
+                f"Unknown SETTLEMENT_INSTRUMENT {self.instrument!r}. "
+                "Expected 'payment_link' or 'reserve_pay'."
+            )
+        if self.instrument == "reserve_pay" and not self.mock:
+            raise RazorpayConfigError(
+                "SETTLEMENT_INSTRUMENT=reserve_pay is a simulation — UPI Reserve Pay is in "
+                "closed beta and this project has no real integration for it. Refusing to "
+                "run it against live Razorpay credentials, where it would report fabricated "
+                "debits as settlements. Set MOCK_RAZORPAY=true to explore it."
+            )
+
+        self._reserve_pay = MockReservePay() if self.instrument == "reserve_pay" else None
+
         if not self.mock:
             if not key_id.startswith("rzp_test_"):
                 raise RazorpayConfigError(
@@ -286,6 +309,63 @@ class RazorpayGateway:
             return False, f"Could not reach Razorpay: {detail}"
 
         return True, "credentials accepted"
+
+    def create_charge(
+        self,
+        *,
+        amount_paise: int,
+        description: str,
+        reference_id: str,
+        agent_id: str,
+        notes: dict | None = None,
+        already_debited_paise: int = 0,
+    ) -> dict:
+        """Settles a batch through whichever instrument is configured.
+
+        The seam the README's "only one file changes" claim rests on. Callers
+        ask for a batch to be charged and do not know, or need to know, whether
+        that becomes a hosted Payment Link or a debit against a UPI Reserve Pay
+        mandate — both return the same shape.
+
+        `SETTLEMENT_INSTRUMENT` selects:
+
+          * `payment_link` (default) — a hosted page, which is what actually
+            works against Razorpay today.
+          * `reserve_pay` — a simulated mandate debit. See reserve_pay.py for
+            what it does and does not model, and why it is the right shape for
+            agent traffic even though it does not fix the ₹1 floor.
+
+        Args:
+            amount_paise: Total to charge.
+            description: Shown to whoever opens a link. Ignored by a debit,
+                which nobody opens.
+            reference_id: Our batch id.
+            agent_id: The paying agent.
+            notes: Extra metadata for the Payment Link path.
+            already_debited_paise: For `reserve_pay`, what this agent's
+                mandate has already been drawn down by. Ignored otherwise.
+
+        Returns:
+            `{"id", "short_url", "status", "mode", "instrument", ...}`.
+            `short_url` is None for a mandate debit.
+        """
+        if self.instrument == "reserve_pay":
+            mandate = self._reserve_pay.ensure_mandate(agent_id)
+            return self._reserve_pay.debit(
+                mandate=mandate,
+                amount_paise=amount_paise,
+                reference_id=reference_id,
+                already_debited_paise=already_debited_paise,
+            )
+
+        link = self.create_payment_link(
+            amount_paise=amount_paise,
+            description=description,
+            reference_id=reference_id,
+            agent_id=agent_id,
+            notes=notes,
+        )
+        return {**link, "instrument": "payment_link"}
 
     def create_payment_link(
         self,
