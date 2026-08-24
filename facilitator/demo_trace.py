@@ -45,6 +45,7 @@ from typing import Any
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import APIRouter, HTTPException
+from limits import LimitExceeded
 from payment_verifier import (
     ALGORITHM,
     VerificationError,
@@ -70,6 +71,7 @@ def configure(
     hmac_secret: str,
     offer_policy: Any,
     resource_url: str,
+    spend_policy: Any = None,
 ) -> None:
     """Wires this router to the facilitator's already-configured objects.
 
@@ -81,13 +83,37 @@ def configure(
         hmac_secret: The shared signing secret.
         offer_policy: `OfferPolicy` used for quoting.
         resource_url: Base URL of the resource server, e.g. http://localhost:3402.
+        spend_policy: `SpendPolicy` to apply before quoting. Optional only so
+            a caller that does not care about limits still works; `main.py`
+            always passes it. Without it this endpoint would quote in-process
+            and skip the checks `POST /offer` applies — the settle-time cap
+            would still catch an over-budget run, but the console would look
+            like the way around the control rather than a demonstration of it.
     """
     _ctx.update(
         ledger=ledger,
         hmac_secret=hmac_secret,
         offer_policy=offer_policy,
         resource_url=resource_url.rstrip("/"),
+        spend_policy=spend_policy,
     )
+
+
+def _refuse(agent_id: str, exc: LimitExceeded) -> None:
+    """Records a policy refusal and turns it into the right HTTP status.
+
+    429 for the rate limit because retrying shortly will work; 403 for a cap
+    or a freeze because it will not.
+    """
+    _ctx["ledger"].log_event(
+        "demo_run_refused_by_policy",
+        agent_id=agent_id,
+        status="rejected",
+        reason=exc.reason,
+        message=exc.message,
+        **exc.detail,
+    )
+    raise HTTPException(429 if exc.reason == "offer_rate_exceeded" else 403, exc.message)
 
 
 def _console_agent_key(agent_id: str) -> tuple[str, str]:
@@ -257,6 +283,21 @@ def run_demo(request: DemoRunRequest) -> dict:
     path = RESOURCE_PATHS.get(request.resource, RESOURCE_PATHS["market-report"])
     url = f"{_ctx['resource_url']}{path}"
 
+    # The admission and rate checks `POST /offer` applies. Enforced here too
+    # because this endpoint quotes in-process rather than over HTTP, so
+    # without it the console would be the one path that skipped them. The
+    # daily cap cannot be checked yet — it needs the price, which arrives with
+    # the 402 in step 1 — so it happens there instead.
+    policy = _ctx.get("spend_policy")
+    if policy is not None:
+        try:
+            policy.check_admission(agent_id)
+            policy.check_offer_rate(
+                agent_id, _ctx["ledger"].recent_offer_count(agent_id=agent_id)
+            )
+        except LimitExceeded as exc:
+            _refuse(agent_id, exc)
+
     # One-time per identity, and cheap when it has already happened.
     agent_private_key = _ensure_registered(agent_id)
 
@@ -314,6 +355,18 @@ def run_demo(request: DemoRunRequest) -> dict:
         accepted = required["accepts"][0]
         amount_paise = int(accepted["amount"])
         pay_to = accepted["payTo"]
+
+        # The cap check, now that the 402 has revealed the price. Before the
+        # offer is written, so a refused run leaves no consumed offer behind.
+        if policy is not None:
+            try:
+                policy.check_daily_cap(
+                    agent_id,
+                    _ctx["ledger"].committed_today(agent_id=agent_id),
+                    amount_paise,
+                )
+            except LimitExceeded as exc:
+                _refuse(agent_id, exc)
         # Same fallback crawler_agent.py uses: the 402 does not carry a
         # resourceId today, only the URL does.
         resource_id = path.rstrip("/").rsplit("/", 1)[-1]

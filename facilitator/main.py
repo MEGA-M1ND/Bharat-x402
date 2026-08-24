@@ -47,7 +47,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from ledger import Ledger, redact_credentials, today_utc
+from ledger import DailyCapExceeded, Ledger, redact_credentials, today_utc
+from limits import LimitExceeded, SpendPolicy
 from payment_verifier import (
     ALGORITHM,
     KeyFormatError,
@@ -175,6 +176,11 @@ gateway = RazorpayGateway(
 )
 fee_model = FeeModel.from_env()
 
+# Per-agent spending controls. `OFFER_POLICY.max_amount_paise` caps one quote;
+# this caps what an agent can do with many of them. See limits.py on why a
+# transaction-size limit is not a spending limit.
+SPEND_POLICY = SpendPolicy.from_env()
+
 app = FastAPI(
     title="Bharat x402 Facilitator",
     description="INR settlement facilitator for the x402 agent payment protocol.",
@@ -209,6 +215,7 @@ if ENABLE_DEMO_API:
         hmac_secret=HMAC_SECRET,
         offer_policy=OFFER_POLICY,
         resource_url=RESOURCE_URL,
+        spend_policy=SPEND_POLICY,
     )
     app.include_router(demo_trace.router)
 
@@ -410,6 +417,10 @@ def supported() -> dict:
                     "hmacFallbackAllowed": ALLOW_HMAC_FALLBACK,
                     "offerEndpoint": "/offer",
                     "minimumChargePaise": fee_model.minimum_charge_paise,
+                    # A limit a client cannot discover is one it can only find
+                    # out about by being refused.
+                    "maxOfferPaise": OFFER_POLICY.max_amount_paise,
+                    "limits": SPEND_POLICY.describe(),
                 },
             }
         ],
@@ -715,7 +726,27 @@ def settle(request: X402Request) -> JSONResponse:
             amount_paise=result["amountPaise"],
             asset=result["asset"],
             mode=SETTLEMENT_MODE,
+            daily_cap_paise=SPEND_POLICY.cap_for_sql,
         )
+    except DailyCapExceeded as exc:
+        # The binding check, and the one that holds under concurrency — the
+        # quote-time check above can be raced by two settlements arriving at
+        # once. The offer is left spendable: the transaction rolled back, so a
+        # cap breach costs the agent nothing but this request.
+        ledger.log_event(
+            "settle_refused_by_policy",
+            agent_id=exc.agent_id,
+            resource_id=result["resourceId"],
+            amount_paise=exc.amount_paise,
+            status="rejected",
+            reason="daily_cap_exceeded",
+            message=str(exc),
+            dailyCapPaise=exc.daily_cap_paise,
+            committedPaise=exc.committed_paise,
+            remainingPaise=exc.remaining_paise,
+            note="Offer left open — the transaction rolled back.",
+        )
+        return failure("daily_cap_exceeded", str(exc), agent_id=exc.agent_id)
     except ValueError as exc:
         # Lost a race against a concurrent settle, or the offer was already
         # spent. Either way the correct answer is the existing commitment.
@@ -888,6 +919,36 @@ def offer(request: OfferRequest) -> JSONResponse:
                     f"not {request.scheme} on {request.network}."
                 ),
             },
+        )
+
+    # Spending controls, before anything is written. Refusing at quote time is
+    # the useful place: the agent finds out before it signs, and a refused
+    # quote costs the facilitator one row it does not create.
+    try:
+        SPEND_POLICY.check_admission(request.agentId)
+        SPEND_POLICY.check_offer_rate(
+            request.agentId,
+            ledger.recent_offer_count(agent_id=request.agentId),
+        )
+        SPEND_POLICY.check_daily_cap(
+            request.agentId,
+            ledger.committed_today(agent_id=request.agentId),
+            request.amountPaise,
+        )
+    except LimitExceeded as exc:
+        ledger.log_event(
+            "offer_refused_by_policy",
+            agent_id=request.agentId,
+            resource_id=request.resourceId,
+            amount_paise=request.amountPaise,
+            status="rejected",
+            reason=exc.reason,
+            message=exc.message,
+            **exc.detail,
+        )
+        return JSONResponse(
+            status_code=429 if exc.reason == "offer_rate_exceeded" else 403,
+            content={"error": exc.reason, "message": exc.message, **exc.detail},
         )
 
     try:
@@ -1160,6 +1221,32 @@ def ledger_summary(settleDate: str | None = None, agentId: str | None = None) ->
     settle, everyone else's pending commitments too.
     """
     return ledger.daily_summary(settleDate, agent_id=agentId)
+
+
+@app.get("/agents/{agent_id}/limits")
+def agent_limits(agent_id: str, settleDate: str | None = None) -> dict:
+    """What this agent has spent against its cap, and what is left.
+
+    Exists so an agent can manage its own budget instead of discovering the
+    ceiling by being refused mid-task. Safe to expose: it reports one agent's
+    own totals, which that agent already knows, and the policy figures are
+    advertised on `/supported` regardless.
+    """
+    settle_date = settleDate or today_utc()
+    committed = ledger.committed_today(agent_id=agent_id, settle_date=settle_date)
+    cap = SPEND_POLICY.daily_cap_paise
+
+    return {
+        "agentId": agent_id,
+        "settleDate": settle_date,
+        "committedPaise": committed,
+        "dailyCapPaise": cap or None,
+        "remainingPaise": max(cap - committed, 0) if cap > 0 else None,
+        "recentOffersLastMinute": ledger.recent_offer_count(agent_id=agent_id),
+        "offerRatePerMinute": SPEND_POLICY.offer_rate_per_minute or None,
+        "frozen": agent_id in SPEND_POLICY.frozen_agents,
+        "acceptingPayments": SPEND_POLICY.accept_payments,
+    }
 
 
 @app.get("/economics")

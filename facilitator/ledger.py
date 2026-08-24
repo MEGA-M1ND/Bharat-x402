@@ -57,7 +57,7 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import db
@@ -77,6 +77,43 @@ DEFAULT_DB_PATH = os.getenv("LEDGER_DB_PATH", "./data/ledger.db")
 # seconds late; long enough that a burst of events during an outage does not
 # pay a connection timeout each. See `Ledger._audit_writes_allowed`.
 AUDIT_BREAKER_SECONDS = float(os.getenv("LEDGER_AUDIT_BREAKER_SECONDS", "30"))
+
+# Default cap for `create_commitment`, meaning "no limit". Kept here rather
+# than imported from limits.py so ledger.py stays free of any dependency on
+# the policy layer — the ledger enforces a number it is handed, and has no
+# opinion about where that number comes from.
+UNLIMITED_PAISE = 2**62
+
+
+class DailyCapExceeded(Exception):
+    """Booking a commitment would take an agent over its daily cap.
+
+    Deliberately not a `ValueError`. `main.py` already maps `ValueError` from
+    `create_commitment` to "this offer was already spent, return the existing
+    commitment" — and treating a cap breach that way would answer a refused
+    payment with somebody else's receipt.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        settle_date: str,
+        committed_paise: int,
+        amount_paise: int,
+        daily_cap_paise: int,
+    ) -> None:
+        self.agent_id = agent_id
+        self.settle_date = settle_date
+        self.committed_paise = committed_paise
+        self.amount_paise = amount_paise
+        self.daily_cap_paise = daily_cap_paise
+        self.remaining_paise = max(daily_cap_paise - committed_paise, 0)
+        super().__init__(
+            f"agent {agent_id} has committed {committed_paise} paise on {settle_date}; "
+            f"adding {amount_paise} would exceed the cap of {daily_cap_paise} paise "
+            f"({self.remaining_paise} remaining)"
+        )
 
 
 # Matches the `user:password@` portion of any connection URL. Database driver
@@ -559,6 +596,56 @@ class Ledger:
             cur = conn.execute("SELECT * FROM offers WHERE offer_id = ?", (offer_id,))
             return cur.fetchone()
 
+    def recent_offer_count(self, *, agent_id: str, within_seconds: int = 60) -> int:
+        """How many quotes an agent has been issued recently.
+
+        Counts `offers.issued_at` rather than reading the `events` table: the
+        offers row is the thing that was actually created, and it is the table
+        the rate limit is trying to protect from growing without bound.
+
+        String comparison on ISO-8601 UTC timestamps, which sort
+        lexicographically — the reason `utc_now` renders them that way, and
+        why this needs no date functions and behaves identically in both
+        engines.
+        """
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=within_seconds)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM offers WHERE agent_id = ? AND issued_at >= ?",
+                (agent_id, cutoff),
+            ).fetchone()
+        return int(row["n"])
+
+    def committed_today(self, *, agent_id: str, settle_date: str | None = None) -> int:
+        """What an agent has already committed for a settlement date, in paise.
+
+        Every commitment regardless of status, because a settled one is still
+        money the agent owes or has paid — excluding it would let an agent
+        reset its own cap by triggering a batch run.
+        """
+        settle_date = settle_date or today_utc()
+        with self._connect() as conn:
+            return self._committed_in(conn, agent_id=agent_id, settle_date=settle_date)
+
+    @staticmethod
+    def _committed_in(conn: db.Conn, *, agent_id: str, settle_date: str) -> int:
+        """The same sum, on a connection the caller already holds.
+
+        Exists so the refusal path inside `create_commitment` can report the
+        current total without opening a second connection mid-transaction —
+        which under Postgres would read outside the transaction it is about to
+        roll back, and report a number that never existed.
+        """
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount_paise), 0) AS total FROM commitments"
+            " WHERE agent_id = ? AND settle_date = ?",
+            (agent_id, settle_date),
+        ).fetchone()
+        return int(row["total"])
+
     # -- commitments -------------------------------------------------------
 
     def get_commitment_by_offer(self, offer_id: str) -> Mapping[str, Any] | None:
@@ -582,6 +669,7 @@ class Ledger:
         asset: str,
         mode: str,
         settle_date: str | None = None,
+        daily_cap_paise: int = UNLIMITED_PAISE,
     ) -> dict:
         """Turns an open offer into a commitment, atomically.
 
@@ -615,12 +703,18 @@ class Ledger:
             asset: Currency code.
             mode: "deferred" or "per_request".
             settle_date: Batching key; defaults to today UTC.
+            daily_cap_paise: Most this agent may have committed for
+                `settle_date`, enforced inside the INSERT below. Defaults to
+                effectively unlimited so every existing caller — the tests,
+                the CLI flows — behaves exactly as before.
 
         Returns:
             The created commitment as a dict.
 
         Raises:
             ValueError: If the offer is missing or already spent.
+            DailyCapExceeded: If booking this would take the agent over its
+                cap. The transaction rolls back, so the offer stays spendable.
         """
         settle_date = settle_date or today_utc()
         created_at = utc_now()
@@ -639,10 +733,24 @@ class Ledger:
                 raise ValueError(f"offer {offer_id} is already {row['status']}")
 
             try:
-                conn.execute(
+                # `INSERT ... SELECT ... WHERE <cap not breached>` rather than
+                # reading the total and then deciding, for the same reason the
+                # offer above is claimed with a conditional UPDATE: two
+                # concurrent settlements would both pass a separate SELECT and
+                # both insert, landing the agent over its cap by one payment.
+                # Folding the check into the INSERT makes that impossible —
+                # the subquery is evaluated inside the same statement.
+                #
+                # A refusal raises, which rolls the whole transaction back
+                # (see db.connect), so the offer claimed above returns to
+                # 'open' and the agent can spend it tomorrow rather than
+                # having it burned by hitting a limit.
+                inserted = conn.execute(
                     "INSERT INTO commitments (commitment_id, offer_id, agent_id, resource_id,"
                     " amount_paise, asset, created_at, settle_date, mode, status)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                    " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'"
+                    " WHERE COALESCE((SELECT SUM(amount_paise) FROM commitments"
+                    "                 WHERE agent_id = ? AND settle_date = ?), 0) + ? <= ?",
                     (
                         commitment_id,
                         offer_id,
@@ -653,8 +761,23 @@ class Ledger:
                         created_at,
                         settle_date,
                         mode,
+                        agent_id,
+                        settle_date,
+                        int(amount_paise),
+                        int(daily_cap_paise),
                     ),
                 )
+                if inserted.rowcount == 0:
+                    already = self._committed_in(
+                        conn, agent_id=agent_id, settle_date=settle_date
+                    )
+                    raise DailyCapExceeded(
+                        agent_id=agent_id,
+                        settle_date=settle_date,
+                        committed_paise=already,
+                        amount_paise=int(amount_paise),
+                        daily_cap_paise=int(daily_cap_paise),
+                    )
             except db.UniqueConstraintError as exc:
                 # Should be unreachable given the claim above — offer_id
                 # UNIQUE is a backstop, not the primary guard. Kept because an

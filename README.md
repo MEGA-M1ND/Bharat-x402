@@ -15,7 +15,7 @@ whole negotiation yourself, no install.
 | Razorpay charges that took | **5** — one Payment Link per agent, 55 gateway calls avoided |
 | Revenue **impossible** to collect per-request | **₹30.00 of ₹30.00** — every charge under Razorpay's ₹1.00 floor |
 | Razorpay's ₹1 floor | verified by posting 50 paise to the live test API, not read off a doc |
-| Tests | **156** — 146 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
+| Tests | **184** — 174 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
 
 ```
       key   agent-perplexity-bot
@@ -229,7 +229,7 @@ advice; the client is the wall.
 
 ---
 
-## Three things this gets right that a demo usually doesn't
+## Four things this gets right that a demo usually doesn't
 
 ### 1. The agent signs with a key the facilitator does not have
 
@@ -290,7 +290,46 @@ is the one endpoint an unauthenticated stranger can POST to and have money marke
   money; an expiry on an unpaid link returns its commitments to `pending` so the next run
   re-bills them.
 
-### 3. The double-charge guarantee is enforced by the database
+### 3. The facilitator does not trust the agent's own budget
+
+`agent-kit` enforces a budget before it buys — the right place for an agent's own
+discipline, and worth nothing to the facilitator. The client is the party whose behaviour
+is in question, and anyone can write a different one.
+
+Before this the only limit was `MAX_OFFER_PAISE`, a ceiling on a *single* quote. An agent
+could be quoted ₹1,000 ten thousand times and nothing objected. **"No transaction may
+exceed X" is a transaction-size limit, not a spending limit** — and the gap between those
+two was the whole hole.
+
+Three controls now, all advertised on `/supported` so a client can plan instead of
+discovering them by being refused:
+
+| Control | What it stops |
+| --- | --- |
+| `AGENT_DAILY_CAP_PAISE` | Cumulative committed spend per agent per settlement date — the real liability |
+| `AGENT_OFFER_RATE_PER_MINUTE` | Quote flooding. An offer is a cheap write that costs the agent nothing |
+| `FROZEN_AGENTS` / `ACCEPT_PAYMENTS` | One misbehaving agent, or everything |
+
+The cap is enforced **inside the INSERT that books the commitment**, not by reading the
+total and then deciding:
+
+```sql
+INSERT INTO commitments (...) SELECT ?, ?, …
+ WHERE COALESCE((SELECT SUM(amount_paise) FROM commitments
+                 WHERE agent_id = ? AND settle_date = ?), 0) + ? <= ?
+```
+
+A separate read-then-decide lets two concurrent settlements both pass and land the agent
+one payment over. A test proves the guard is really in the SQL by making the pre-read lie
+and confirming the statement still refuses. A refusal rolls the transaction back, so the
+offer stays spendable — hitting a limit costs the agent nothing but that request.
+
+The stop button is an **environment variable, not an endpoint**, and deliberately so: this
+service has no authentication, so `POST /agents/{id}/freeze` would let any caller disable
+any agent — turning a safety control into a denial-of-service primitive. That is strictly
+worse than having no endpoint.
+
+### 4. The double-charge guarantee is enforced by the database
 
 An offer becomes a commitment through a single conditional `UPDATE ... WHERE status = 'open'`,
 so only one of two concurrent settlements can win — with a `UNIQUE(offer_id)` constraint behind
@@ -368,11 +407,11 @@ The full breakdown, including where fixed fees *do* multiply, is in
 | `demo-agent/` | A crawler that holds its own keypair and narrates the whole negotiation as it pays |
 | `agent-kit/` | **The agent surface.** `x402_client.py` (the negotiation + the budget wall), `tools.py` (the five tools, defined once), `mcp_server.py` (MCP), `researcher.py` (a Claude agent that decides what to buy) |
 | `reporting/` | The publisher's daily revenue digest, formatted as a WhatsApp message |
-| `tests/` | 156 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall), `test_ledger_degradation.py` (behaviour when the ledger is down) |
+| `tests/` | 184 tests — `test_full_flow.py`, `test_agent_keys.py` (crypto + downgrade attacks), `test_webhooks.py`, `test_agent_kit.py` (the budget wall), `test_ledger_degradation.py` (behaviour when the ledger is down), `test_spend_limits.py` (the caps) |
 | `docs/` | [Architecture](docs/architecture.md) · [Demo script](docs/demo-script.md) |
 
 ```bash
-pytest tests -v                                     # 156 tests
+pytest tests -v                                     # 184 tests
 TEST_LEDGER_DSN=postgres://… pytest tests -q        # the same suite, on real Postgres
 ```
 
