@@ -443,11 +443,11 @@ pytest tests -v
 ```
 
 ```
-156 passed in 19.21s
+184 passed in 22.83s
 ```
 
 With both services running, the integration tests exercise the real HTTP path. With them
-stopped you get `146 passed, 10 skipped`. To make skipping fatal — which is what CI does —
+stopped you get `174 passed, 10 skipped`. To make skipping fatal — which is what CI does —
 set `REQUIRE_INTEGRATION=1`.
 
 The same suite also runs against real Postgres rather than SQLite, which is how the
