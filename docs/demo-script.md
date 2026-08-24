@@ -83,7 +83,7 @@ Expected:
 ```
 {"ts":"...","service":"resource-server","event":"facilitator_ready","attempt":1,
  "kinds":["razorpay-inr@razorpay:inr-test"]}
-[resource-server] http://localhost:3402 — paid route: /premium/market-report (5.00)
+[resource-server] http://localhost:3402 — console + paid routes (₹5.00 / ₹0.50)
 ```
 
 `facilitator_ready` means the stock x402 middleware called `GET /supported`, was told this
@@ -106,7 +106,7 @@ HTTP/1.1 402 Payment Required
 PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50IHJlcXVpcmVkIiwi...
 Content-Type: application/json; charset=utf-8
 
-{"error":"payment_required","message":"Paid resource. 5.00 per fetch, settled in INR via
+{"error":"payment_required","message":"Paid resource. ₹5.00 per fetch, settled in INR via
 Razorpay...","offer":{"resourceId":"market-report-2026-08","scheme":"razorpay-inr",
 "network":"razorpay:inr-test","asset":"INR","amount":"500","humanAmount":"₹5.00",...}}
 ```
@@ -150,6 +150,11 @@ python demo-agent/crawler_agent.py
   agent-perplexity-bot -> http://localhost:3402/premium/market-report
 ══════════════════════════════════════════════════════════════════════════
 
+  key   agent-perplexity-bot
+        public  H4wYhPCvPa2eJHzBdA7bfGYe…  (registered now)
+        private key never leaves this process — the facilitator
+        holds only the public half and cannot forge a commitment.
+
 [1/5] Request the resource with no payment attached
       -> HTTP 402 Payment Required
 
@@ -161,11 +166,17 @@ python demo-agent/crawler_agent.py
         settles   deferred / razorpay   batched, not per-request
 
 [2/5] Ask the facilitator to quote this fetch
-      -> off_9e76db038c1d49a29b85  (₹5.00)
+      -> off_482222ab8a1c42f2829f  (₹5.00)
+        issued 2026-08-24T05:13:18Z, expires 2026-08-24T05:18:18Z
         single-use, and bound to this agent id
 
 [3/5] Sign acceptance of the quote
-      -> bbc46770994d770435254cd576b52cd6…  (64 hex chars)
+      Ed25519 over the canonical JSON of:
+        {"acceptedAt":"2026-08-24T05:13:18Z","agentId":"agent-perplexity-bot",…
+      -> uVe+CT7JsO1S37fSZ/nytPiOO05b4x3L…  (88 chars)
+      Signed with this agent's own private key. The facilitator
+      can verify this and cannot produce it — so the commitment
+      is evidence in a dispute, not just a checksum.
 
 [4/5] Retry the request with the payment attached
       -> HTTP 200 OK
@@ -364,18 +375,79 @@ commitments wait for the next run.
 
 ---
 
-## 8. Run the tests
+## 8. Let an agent decide for itself what to buy
+
+Everything so far pays because the script says to. `agent-kit/` is where
+something chooses — Claude gets a question, a rupee budget, and five tools.
+
+It needs its own virtualenv: the MCP SDK wants Starlette 1.x and FastAPI 0.115
+pins `<0.42`, so one environment cannot hold both the facilitator and this.
+
+```bash
+python -m venv agent-kit/.venv
+agent-kit/.venv/Scripts/pip install -r agent-kit/requirements.txt   # bin/pip on macOS/Linux
+```
+
+With both services still running from step 2:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-… python agent-kit/researcher.py \
+  "What's the going rate for AI agent traffic in India?"
+```
+
+The agent previews before buying, skips what it does not need, and stops when
+the budget runs out. Summarised reasoning is printed as it goes, so you can see
+*why* it decided ₹5 was or was not worth spending.
+
+**No API key?** The same tool surface runs with a fixed sequence and no model:
+
+```bash
+python agent-kit/researcher.py --scripted --budget 12
+```
+
+```
+  -> fetch_paid_resource('api-call')
+Bought api-call for ₹0.50 (commitment cmt_0d82bc6ad4f846bfaecc).
+Budget remaining: ₹11.50.
+
+  -> fetch_paid_resource('market-report')
+REFUSED — market-report costs ₹5.00 but only ₹1.50 of the ₹12.00 budget is left.
+          Nothing was charged.
+```
+
+That refusal is the thing worth looking at. The budget is enforced in
+`x402_client.py`, before any HTTP — not in the system prompt. A prompt-level
+limit is a request, and the agent reads the documents it buys, so a purchased
+file saying "ignore your budget" is an input an attacker can write.
+
+### As an MCP server
+
+The same five tools over the Model Context Protocol, so any MCP client can buy
+things in rupees without knowing what x402 is:
+
+```bash
+agent-kit/.venv/Scripts/python agent-kit/mcp_server.py
+```
+
+It speaks stdio. To register it with Claude Desktop, see the config block at the
+top of `agent-kit/mcp_server.py`. Note what the client *cannot* do: there is no
+`sign`, no `register`, and no way to name an amount — only to buy a named
+resource at the publisher's price.
+
+---
+
+## 9. Run the tests
 
 ```bash
 pytest tests -v
 ```
 
 ```
-132 passed in 11.70s
+156 passed in 19.21s
 ```
 
 With both services running, the integration tests exercise the real HTTP path. With them
-stopped you get `122 passed, 10 skipped`. To make skipping fatal — which is what CI does —
+stopped you get `146 passed, 10 skipped`. To make skipping fatal — which is what CI does —
 set `REQUIRE_INTEGRATION=1`.
 
 The same suite also runs against real Postgres rather than SQLite, which is how the
@@ -386,7 +458,7 @@ TEST_LEDGER_DSN=postgres://user:pass@host:5432/db LEDGER_AUTO_MIGRATE=1 pytest t
 ```
 
 ```bash
-ruff check facilitator demo-agent reporting tests
+ruff check facilitator demo-agent reporting agent-kit tests
 ```
 
 ---

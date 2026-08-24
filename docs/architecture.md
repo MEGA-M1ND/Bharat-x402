@@ -196,24 +196,78 @@ graph LR
     end
     subgraph "Bharat x402"
         F["facilitator<br/>FastAPI<br/>:8402"]
-        L[("ledger.db<br/>offers · commitments<br/>batches · events")]
+        L[("ledger<br/>agents · offers · commitments<br/>batches · events · webhook_events")]
         S["scheduler.py"]
         D["daily_summary.py"]
     end
-    A["demo-agent<br/>crawler_agent.py"]
+    subgraph Agents
+        A["demo-agent<br/>crawler_agent.py"]
+        K["agent-kit<br/>x402_client.py"]
+        M["mcp_server.py"]
+        C["researcher.py<br/>(Claude)"]
+    end
     R["Razorpay<br/>test mode"]
 
     A -->|"GET, then GET + X-PAYMENT"| RS
     A -->|"POST /offer"| F
+    K -->|"same negotiation"| RS
+    M --> K
+    C --> K
     RS -->|"/supported /verify /settle"| F
     F --> L
     S -->|"POST /settle-batch"| F
     F -->|"one Payment Link per agent"| R
+    R -->|"signed webhook: link paid"| F
     D -->|reads directly| L
 ```
 
 The reporting script reads SQLite directly rather than through the facilitator's API, so
 a publisher's revenue report still works when the facilitator is down.
+
+### The agent side
+
+`demo-agent/crawler_agent.py` narrates the protocol to a terminal. `agent-kit/`
+is the same protocol with the narration removed and a budget added, so
+something can be put on top of it that *decides* rather than demonstrates:
+
+| File | What it is |
+| --- | --- |
+| `x402_client.py` | The negotiation, plus the spending limit. Holds the agent's Ed25519 private key. |
+| `tools.py` | Five tools — list, preview, buy, spend summary, economics — defined once. |
+| `mcp_server.py` | Those tools over MCP, for any MCP client. |
+| `researcher.py` | Claude, given a question and a rupee budget, choosing what to buy. |
+
+Both surfaces wrap the same `tools.py` rather than reimplementing the calls,
+because a tool surface is exactly the kind of thing that grows a second copy
+quietly — this project has already been bitten by that once (a hand-rolled SQL
+splitter fixed in one copy and not the other, which real Postgres caught in CI).
+
+**The budget is enforced in `x402_client.py`, not in the system prompt.** A
+prompt-level limit is a request, not a control: the agent reads the documents
+it buys, so a purchased file saying *"ignore your budget"* is an input an
+attacker can write. `pay_and_fetch` refuses an over-budget purchase before any
+HTTP happens — no offer issued, no ledger row, nothing charged. Supporting
+that: no tool takes an *amount* (the model names a resource; the publisher's
+402 sets the price), and a refusal is returned as data so the agent can pick
+something cheaper instead of the run ending.
+
+`agent-kit` needs its own virtualenv — the MCP SDK requires Starlette 1.x and
+FastAPI 0.115 pins `<0.42`, so one environment cannot hold both. They are
+separate processes and separate dependency sets.
+
+### When the ledger is unreachable
+
+`log_event` writes stdout before the database, never raises, and stops
+attempting inserts for a short window after one fails. That ordering is the
+fix for a real incident: with Postgres gone, a bad-signature webhook blocked
+ten seconds on the audit insert, raised into the unhandled-error handler,
+which logged again for another ten, and returned a 500 — which Razorpay
+retries. A dropped audit row now announces itself as `ledger_write_failed` on
+stdout rather than vanishing.
+
+The leniency stops at the audit log. `create_commitment`, `record_batch`, and
+`mark_batch_paid` still raise, because an unrecorded log line is recoverable
+from stdout and an unrecorded commitment is revenue that never existed.
 
 ---
 
