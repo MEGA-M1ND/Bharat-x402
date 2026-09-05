@@ -151,6 +151,29 @@ LEGACY_DEMO_PROFILE = {
 }
 
 
+# The same five switches at their PRODUCTION values.
+#
+# Set explicitly rather than deleted, and that distinction is load-bearing.
+# `main.py` calls `load_dotenv(SERVICE_DIR / ".env")` on import, and dotenv
+# does not override variables already present in the environment — but it
+# happily supplies ones that are ABSENT. So deleting these left the .env file
+# free to put the demo values straight back, and every `secure_defaults` test
+# silently asserted against a permissive facilitator.
+#
+# That is exactly what happened: locally the developer's `.env` predated these
+# flags and contained none of them, so deleting genuinely unset them and the
+# tests passed. CI copies the *current* `.env.example`, which sets all five for
+# the demo — so the security tests turned into no-ops there and nowhere else.
+# A security test that passes for the wrong reason is worse than one that fails.
+SECURE_PROFILE = {
+    "DEMO_OPEN_DASHBOARD": "false",
+    "ALLOW_HMAC_FALLBACK": "false",
+    "DEMO_UNSAFE_TOFU": "false",
+    "REQUIRE_CONSENT": "true",
+    "AUTHORITY_REQUIRED": "true",
+}
+
+
 @pytest.fixture(autouse=True)
 def legacy_demo_profile(request, monkeypatch):
     """Runs the pre-Phase-2 permissive profile, unless a test opts out.
@@ -159,15 +182,12 @@ def legacy_demo_profile(request, monkeypatch):
     production configuration instead — closed dashboard, no HMAC fallback, no
     trust-on-first-use, and both consent and reserved authority required.
     """
-    if request.node.get_closest_marker("secure_defaults"):
-        # Explicitly clear rather than merely not setting them: a stray value
-        # in the developer's own environment must not be able to turn a
-        # security test into a passing no-op.
-        for name in LEGACY_DEMO_PROFILE:
-            monkeypatch.delenv(name, raising=False)
-        return
-
-    for name, value in LEGACY_DEMO_PROFILE.items():
+    profile = (
+        SECURE_PROFILE
+        if request.node.get_closest_marker("secure_defaults")
+        else LEGACY_DEMO_PROFILE
+    )
+    for name, value in profile.items():
         monkeypatch.setenv(name, value)
 
 
