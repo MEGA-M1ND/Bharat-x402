@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -122,6 +123,41 @@ def seconds_until(hhmm: str) -> float:
     return (target - now).total_seconds()
 
 
+
+def sweep_expired_reservations() -> int:
+    """Returns authority held by requests that never finished.
+
+    A reservation is taken at /verify and resolved at /settle. Almost always
+    those are microseconds apart inside one HTTP request — but a publisher
+    handler that crashes, a network drop between the two calls, or a killed
+    process leaves the hold in place with nothing coming to capture or release
+    it.
+
+    Without a sweep that authority is stranded until someone notices, and for a
+    prefunded agent that means one dead request quietly reduces its balance for
+    the rest of the day. Fixing it manually would require knowing it happened.
+
+    Runs against the ledger directly rather than over HTTP: it is
+    housekeeping, needs no facilitator process, and should still work when the
+    service is the thing that died.
+
+    Returns:
+        How many holds were returned. Logged even when zero, so "the sweeper
+        is running and finding nothing" is distinguishable from "the sweeper
+        is not running".
+    """
+    from ledger import Ledger
+
+    ledger = Ledger(os.getenv("LEDGER_DSN") or os.getenv("LEDGER_DB_PATH", "./data/ledger.db"))
+    swept = ledger.expire_stale_reservations()
+    log(
+        "reservation_sweep",
+        swept=swept,
+        note="expired holds returned to available authority" if swept else "nothing stale",
+    )
+    return swept
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Runs x402 batch settlement on a schedule.",
@@ -139,17 +175,35 @@ def main() -> int:
     parser.add_argument(
         "--dry-run", action="store_true", help="Report what would settle without charging."
     )
+    parser.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="Skip returning expired authority holds before settling.",
+    )
     args = parser.parse_args()
 
+    def cycle() -> object:
+        """One pass: return stranded authority, then settle.
+
+        Sweeping FIRST is deliberate. An expired hold is authority the agent
+        should have back, and settling before returning it would compute a
+        batch while some of that agent's balance is still spoken for by a
+        request that died — making the run's own view of available authority
+        wrong.
+        """
+        if not args.no_sweep:
+            sweep_expired_reservations()
+        return run_settlement(args.facilitator, dry_run=args.dry_run)
+
     if args.once:
-        result = run_settlement(args.facilitator, dry_run=args.dry_run)
+        result = cycle()
         return 0 if result is not None else 1
 
     if args.interval:
         log("scheduler_started", mode="interval", intervalSeconds=args.interval)
         try:
             while True:
-                run_settlement(args.facilitator, dry_run=args.dry_run)
+                cycle()
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             log("scheduler_stopped")
@@ -162,7 +216,7 @@ def main() -> int:
                 delay = seconds_until(args.daily_at)
                 log("scheduler_sleeping", seconds=round(delay), nextRun=args.daily_at)
                 time.sleep(delay)
-                run_settlement(args.facilitator, dry_run=args.dry_run)
+                cycle()
                 # Guard against the clock landing back inside the same minute
                 # and firing a second time.
                 time.sleep(61)

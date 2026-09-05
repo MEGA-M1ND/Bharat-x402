@@ -195,6 +195,84 @@ CREATE TABLE IF NOT EXISTS consent_publishers (
     FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
 );
 
+-- ======================================================================
+-- AUTHORITY: what actually stands behind a request
+-- ======================================================================
+
+-- The balance a consent draws against.
+--
+-- WHAT THIS IS NOT: money. Nothing here is held at a bank, and no NPCI
+-- mandate exists. `simulated_reserve` models the *domain* behaviour of UPI
+-- Reserve Pay — an amount blocked up front and debited repeatedly — because
+-- the accounting and concurrency questions are real even when the block is
+-- not. See docs/gap-analysis.md, which says so in the same words.
+--
+-- Every column is integer paise, and they are related by an invariant the
+-- tests assert:
+--
+--     funded = available + reserved + captured - refunded
+--
+-- `available` is what a new request may draw on. `reserved` is held for
+-- requests in flight. `captured` has been converted into a receivable and is
+-- gone from this account's spendable balance for good.
+CREATE TABLE IF NOT EXISTS authority_accounts (
+    account_id      TEXT PRIMARY KEY,
+    consent_id      TEXT NOT NULL UNIQUE,
+    operator_id     TEXT NOT NULL,
+    -- prefunded        a balance topped up in advance. No credit risk.
+    -- simulated_reserve a modelled Reserve Pay block. Explicitly simulated.
+    -- credit           no funds at all; a limit the platform is exposed to.
+    backing         TEXT NOT NULL,
+    currency        TEXT NOT NULL DEFAULT 'INR',
+    funded_paise    INTEGER NOT NULL DEFAULT 0,
+    available_paise INTEGER NOT NULL DEFAULT 0,
+    reserved_paise  INTEGER NOT NULL DEFAULT 0,
+    captured_paise  INTEGER NOT NULL DEFAULT 0,
+    refunded_paise  INTEGER NOT NULL DEFAULT 0,
+    -- Credit only: how far the platform will let exposure run. Zero for the
+    -- funded backings, where `available_paise` is the whole story.
+    credit_limit_paise INTEGER NOT NULL DEFAULT 0,
+    -- Collection failures that have not been recovered. Past a threshold this
+    -- suspends further authorization — see limits.py.
+    overdue_paise   INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id),
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- An amount held against an account while a request is in flight.
+--
+-- The lifecycle that makes "content is released against authority" true
+-- rather than aspirational:
+--
+--   held      -> reserved before the handler runs
+--   captured  -> fulfillment succeeded; converted to a receivable, once
+--   released  -> fulfillment failed; the authority goes back
+--   expired   -> neither happened before the TTL; swept back
+--
+-- `offer_id` is UNIQUE. That is the exactly-once guarantee for capture,
+-- enforced by the database rather than by application logic remembering to
+-- check — the same discipline as `commitments.offer_id`. A retried request
+-- finds the existing reservation instead of holding a second amount.
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    consent_id     TEXT NOT NULL,
+    agent_id       TEXT NOT NULL,
+    offer_id       TEXT NOT NULL UNIQUE,
+    amount_paise   INTEGER NOT NULL,
+    -- held | captured | released | expired
+    status         TEXT NOT NULL DEFAULT 'held',
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    resolved_at    TEXT,
+    commitment_id  TEXT,
+    FOREIGN KEY (account_id) REFERENCES authority_accounts (account_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id      TEXT PRIMARY KEY,
     agent_id      TEXT NOT NULL,
@@ -326,3 +404,6 @@ CREATE INDEX IF NOT EXISTS idx_consents_agent ON spending_consents (agent_id, st
 CREATE INDEX IF NOT EXISTS idx_agents_operator ON agents (operator_id);
 -- Tenant-scoped reads: "everything this operator is on the hook for".
 CREATE INDEX IF NOT EXISTS idx_commitments_operator ON commitments (operator_id, settle_date);
+-- The sweeper's query: held reservations past their TTL.
+CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON reservations (status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_authority_operator ON authority_accounts (operator_id);

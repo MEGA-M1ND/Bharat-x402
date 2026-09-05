@@ -57,6 +57,7 @@ import secrets
 import uuid
 from typing import Any
 
+import authority
 import identity
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
@@ -194,6 +195,20 @@ class EnrollRequest(BaseModel):
 
 class ConsentCreate(BaseModel):
     agentId: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")
+    # What stands behind the spend. An authority account is created with the
+    # consent rather than as a separate call, because a consent with no
+    # authority behind it is the exact state Phase 3 exists to eliminate —
+    # making it a second, forgettable step would reintroduce it.
+    #
+    #   prefunded         a balance topped up in advance. No credit risk.
+    #   simulated_reserve a modelled UPI Reserve Pay block. Explicitly a
+    #                     simulation: no NPCI mandate and no money is held.
+    #   credit            no funds; exposure the platform carries.
+    backing: str = Field(
+        default="prefunded", pattern=r"^(prefunded|simulated_reserve|credit)$"
+    )
+    fundedPaise: int = Field(default=0, ge=0)
+    creditLimitPaise: int = Field(default=0, ge=0)
     # 0 means "no limit configured for this dimension" — see
     # ledger.create_consent. Negative values are refused outright.
     perRequestLimitPaise: int = Field(default=0, ge=0)
@@ -206,6 +221,12 @@ class ConsentCreate(BaseModel):
 
 class StatusChange(BaseModel):
     status: str = Field(pattern=r"^(active|suspended|revoked|closed)$")
+
+
+class FundRequest(BaseModel):
+    # Positive only. A negative "top-up" would be a withdrawal wearing the
+    # wrong name, and withdrawals need their own accounting.
+    amountPaise: int = Field(gt=0)
 
 
 # ------------------------------------------------------------------- routes
@@ -722,8 +743,21 @@ def create_consent(
                 },
             )
 
+    if body.backing == "credit" and body.creditLimitPaise <= 0:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "credit_limit_required",
+                "message": (
+                    "Credit-backed authority needs a creditLimitPaise. Without a "
+                    "ceiling there is nothing bounding the platform's exposure."
+                ),
+            },
+        )
+
+    consent_id = f"con_{uuid.uuid4().hex[:16]}"
     created = ledger.create_consent(
-        consent_id=f"con_{uuid.uuid4().hex[:16]}",
+        consent_id=consent_id,
         operator_id=operator_id,
         agent_id=body.agentId,
         per_request_limit_paise=body.perRequestLimitPaise,
@@ -733,6 +767,24 @@ def create_consent(
         valid_until=body.validUntil,
         merchant_ids=body.merchantIds,
     )
+
+    account = ledger.create_authority_account(
+        account_id=f"aut_{uuid.uuid4().hex[:16]}",
+        consent_id=consent_id,
+        operator_id=operator_id,
+        backing=body.backing,
+        funded_paise=body.fundedPaise,
+        credit_limit_paise=body.creditLimitPaise,
+    )
+    created["authority"] = account
+    if body.backing == "simulated_reserve":
+        # Said in the response, not only in the docs. A client must be able
+        # to tell a simulation from a settled fact without reading a README.
+        created["authority"]["simulated"] = True
+        created["authority"]["note"] = (
+            "simulated_reserve models UPI Reserve Pay's block/debit shape. No "
+            "NPCI mandate exists and no money is held anywhere."
+        )
     ledger.log_event(
         "consent_created",
         agent_id=body.agentId,
@@ -843,6 +895,121 @@ def whoami(request: Request, authorization: str | None = Header(default=None)) -
             "tenantKind": principal.tenant_kind,
             "tenantId": principal.tenant_id,
             "scopes": list(principal.scopes),
+        },
+    )
+
+
+@router.get("/consents/{consent_id}/authority")
+def read_authority(
+    consent_id: str, request: Request, authorization: str | None = Header(default=None)
+) -> JSONResponse:
+    """The five figures that must never be merged into one.
+
+    available / reserved / captured / refunded / overdue, plus the derived
+    exposure. A dashboard that collapses any two of these is a dashboard that
+    reports money which has not arrived.
+    """
+    try:
+        principal = _principal(request, authorization)
+        principal.require(identity.SCOPE_CONSENT_READ)
+        operator_id = principal.require_operator()
+    except AuthError as exc:
+        return auth_error_response(exc)
+
+    ledger = _ledger(request)
+    consent = ledger.get_consent(consent_id)
+    if consent is None or consent["operator_id"] != operator_id:
+        return JSONResponse(
+            status_code=404, content={"error": "not_found", "message": "No such consent."}
+        )
+
+    account = ledger.get_authority_account(consent_id=consent_id)
+    if account is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "no_authority_account", "message": "No authority account."},
+        )
+
+    return JSONResponse(status_code=200, content=authority.snapshot_from_row(account).as_dict())
+
+
+@router.post("/consents/{consent_id}/authority/fund")
+def fund_authority(
+    consent_id: str,
+    body: FundRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    """Tops up a funded authority balance.
+
+    TEST MODE ONLY, and worth saying plainly: this is **not** a received
+    payment. It is an operator asserting that this much stands behind the
+    consent. A production system would credit this account when money actually
+    arrived — from a Reserve Pay block, a prepayment, or a settled invoice —
+    and this endpoint would not exist in this form.
+    """
+    try:
+        principal = _principal(request, authorization)
+        principal.require(identity.SCOPE_CONSENT_WRITE)
+        operator_id = principal.require_operator()
+    except AuthError as exc:
+        return auth_error_response(exc)
+
+    ledger = _ledger(request)
+    consent = ledger.get_consent(consent_id)
+    if consent is None or consent["operator_id"] != operator_id:
+        return JSONResponse(
+            status_code=404, content={"error": "not_found", "message": "No such consent."}
+        )
+
+    account = ledger.get_authority_account(consent_id=consent_id)
+    if account is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "no_authority_account", "message": "No authority account."},
+        )
+    if account["backing"] == "credit":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "cannot_fund_credit",
+                "message": (
+                    "Credit-backed authority has no balance to top up. Raise "
+                    "creditLimitPaise instead — and note that raising a credit limit "
+                    "increases exposure rather than adding funds."
+                ),
+            },
+        )
+
+    if not ledger.fund_authority_account(
+        account_id=account["account_id"], amount_paise=body.amountPaise
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "account_inactive",
+                "message": "Authority account is not active.",
+            },
+        )
+
+    ledger.log_event(
+        "authority_funded",
+        status="ok",
+        consentId=consent_id,
+        accountId=account["account_id"],
+        amountPaise=body.amountPaise,
+        operatorId=operator_id,
+        note="Test-mode top-up. Not a received payment.",
+    )
+    updated = ledger.get_authority_account(consent_id=consent_id)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "consentId": consent_id,
+            "availablePaise": updated["available_paise"],
+            "fundedPaise": updated["funded_paise"],
+            "simulated": True,
+            "note": "Test-mode top-up. No money was received.",
         },
     )
 

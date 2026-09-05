@@ -346,6 +346,84 @@ CREATE TABLE IF NOT EXISTS consent_publishers (
     FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
 );
 
+-- ======================================================================
+-- AUTHORITY: what actually stands behind a request
+-- ======================================================================
+
+-- The balance a consent draws against.
+--
+-- WHAT THIS IS NOT: money. Nothing here is held at a bank, and no NPCI
+-- mandate exists. `simulated_reserve` models the *domain* behaviour of UPI
+-- Reserve Pay — an amount blocked up front and debited repeatedly — because
+-- the accounting and concurrency questions are real even when the block is
+-- not. See docs/gap-analysis.md, which says so in the same words.
+--
+-- Every column is integer paise, and they are related by an invariant the
+-- tests assert:
+--
+--     funded = available + reserved + captured - refunded
+--
+-- `available` is what a new request may draw on. `reserved` is held for
+-- requests in flight. `captured` has been converted into a receivable and is
+-- gone from this account's spendable balance for good.
+CREATE TABLE IF NOT EXISTS authority_accounts (
+    account_id      TEXT PRIMARY KEY,
+    consent_id      TEXT NOT NULL UNIQUE,
+    operator_id     TEXT NOT NULL,
+    -- prefunded        a balance topped up in advance. No credit risk.
+    -- simulated_reserve a modelled Reserve Pay block. Explicitly simulated.
+    -- credit           no funds at all; a limit the platform is exposed to.
+    backing         TEXT NOT NULL,
+    currency        TEXT NOT NULL DEFAULT 'INR',
+    funded_paise    INTEGER NOT NULL DEFAULT 0,
+    available_paise INTEGER NOT NULL DEFAULT 0,
+    reserved_paise  INTEGER NOT NULL DEFAULT 0,
+    captured_paise  INTEGER NOT NULL DEFAULT 0,
+    refunded_paise  INTEGER NOT NULL DEFAULT 0,
+    -- Credit only: how far the platform will let exposure run. Zero for the
+    -- funded backings, where `available_paise` is the whole story.
+    credit_limit_paise INTEGER NOT NULL DEFAULT 0,
+    -- Collection failures that have not been recovered. Past a threshold this
+    -- suspends further authorization — see limits.py.
+    overdue_paise   INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id),
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- An amount held against an account while a request is in flight.
+--
+-- The lifecycle that makes "content is released against authority" true
+-- rather than aspirational:
+--
+--   held      -> reserved before the handler runs
+--   captured  -> fulfillment succeeded; converted to a receivable, once
+--   released  -> fulfillment failed; the authority goes back
+--   expired   -> neither happened before the TTL; swept back
+--
+-- `offer_id` is UNIQUE. That is the exactly-once guarantee for capture,
+-- enforced by the database rather than by application logic remembering to
+-- check — the same discipline as `commitments.offer_id`. A retried request
+-- finds the existing reservation instead of holding a second amount.
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    consent_id     TEXT NOT NULL,
+    agent_id       TEXT NOT NULL,
+    offer_id       TEXT NOT NULL UNIQUE,
+    amount_paise   INTEGER NOT NULL,
+    -- held | captured | released | expired
+    status         TEXT NOT NULL DEFAULT 'held',
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    resolved_at    TEXT,
+    commitment_id  TEXT,
+    FOREIGN KEY (account_id) REFERENCES authority_accounts (account_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id      TEXT PRIMARY KEY,
     agent_id      TEXT NOT NULL,
@@ -477,6 +555,9 @@ CREATE INDEX IF NOT EXISTS idx_consents_agent ON spending_consents (agent_id, st
 CREATE INDEX IF NOT EXISTS idx_agents_operator ON agents (operator_id);
 -- Tenant-scoped reads: "everything this operator is on the hook for".
 CREATE INDEX IF NOT EXISTS idx_commitments_operator ON commitments (operator_id, settle_date);
+-- The sweeper's query: held reservations past their TTL.
+CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON reservations (status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_authority_operator ON authority_accounts (operator_id);
 """
 
 
@@ -1373,6 +1454,333 @@ class Ledger:
             }
             for r in rows
         ]
+
+    # -- authority accounts and reservations -------------------------------
+
+    def create_authority_account(
+        self,
+        *,
+        account_id: str,
+        consent_id: str,
+        operator_id: str,
+        backing: str,
+        funded_paise: int = 0,
+        credit_limit_paise: int = 0,
+    ) -> dict:
+        """Opens the balance a consent draws against.
+
+        `funded_paise` is credited to `available_paise` at creation, which is
+        what makes the invariant hold from the first row:
+
+            funded = available + reserved + captured - refunded
+        """
+        now = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO authority_accounts (account_id, consent_id, operator_id, backing,"
+                " funded_paise, available_paise, reserved_paise, captured_paise, refunded_paise,"
+                " credit_limit_paise, overdue_paise, status, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, 0, 'active', ?, ?)",
+                (
+                    account_id,
+                    consent_id,
+                    operator_id,
+                    backing,
+                    int(funded_paise),
+                    int(funded_paise),
+                    int(credit_limit_paise),
+                    now,
+                    now,
+                ),
+            )
+        return {
+            "accountId": account_id,
+            "consentId": consent_id,
+            "operatorId": operator_id,
+            "backing": backing,
+            "fundedPaise": int(funded_paise),
+            "availablePaise": int(funded_paise),
+            "creditLimitPaise": int(credit_limit_paise),
+        }
+
+    def get_authority_account(self, *, consent_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM authority_accounts WHERE consent_id = ?", (consent_id,)
+            ).fetchone()
+
+    def fund_authority_account(self, *, account_id: str, amount_paise: int) -> bool:
+        """Tops up a prefunded or simulated-reserve balance.
+
+        Test mode only. This is not a received payment — it is an operator
+        control-plane call that says "assume this much is behind the consent".
+        Both counters move together so the invariant is never briefly false.
+        """
+        if amount_paise <= 0:
+            raise ValueError("top-up must be a positive integer paise amount")
+        with _WRITE_LOCK, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE authority_accounts"
+                "   SET funded_paise = funded_paise + ?,"
+                "       available_paise = available_paise + ?,"
+                "       updated_at = ?"
+                " WHERE account_id = ? AND status = 'active'",
+                (int(amount_paise), int(amount_paise), utc_now(), account_id),
+            )
+            return result.rowcount > 0
+
+    def reserve_authority(
+        self,
+        *,
+        reservation_id: str,
+        account_id: str,
+        consent_id: str,
+        agent_id: str,
+        offer_id: str,
+        amount_paise: int,
+        ttl_seconds: int,
+        backing: str,
+        credit_limit_paise: int,
+    ) -> Mapping[str, Any]:
+        """Holds `amount_paise` against an account, atomically.
+
+        THE ONE THING THIS FUNCTION EXISTS TO GET RIGHT: the availability
+        check is inside the UPDATE's WHERE clause, never a preceding SELECT.
+
+            UPDATE ... WHERE account_id = ? AND available_paise >= ?
+
+        `WHERE available_paise >= ?` takes a row lock in both SQLite and
+        Postgres, and only one of two concurrent transactions can ever observe
+        `rowcount == 1`. The loser sees `0` and is refused. A read-then-write
+        would let both pass, and a transaction would not help — it serialises
+        the writes, not the decision.
+
+        Credit-backed accounts have no balance to draw down, so the ceiling is
+        checked against the limit instead, by the same mechanism: a predicate
+        in the WHERE clause rather than a decision made beforehand.
+
+        Idempotent on `offer_id`, which is UNIQUE: a retried request finds its
+        existing reservation rather than holding a second amount.
+
+        Returns:
+            The reservation row.
+
+        Raises:
+            AuthorityError: If there is not enough authority, or the account
+                is not active.
+        """
+        from authority import CREDIT, AuthorityError
+
+        now = datetime.now(UTC)
+        created_at = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+        expires_at = (
+            (now + timedelta(seconds=ttl_seconds))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        amount = int(amount_paise)
+
+        with _WRITE_LOCK, self._connect() as conn:
+            # Idempotency first. `ON CONFLICT DO NOTHING` rather than a
+            # try/except INSERT: in Postgres a failed statement aborts the
+            # whole transaction and the recovery SELECT would itself be
+            # refused. SQLite hides that completely, which is exactly why the
+            # suite runs on both.
+            claimed = conn.execute(
+                "INSERT INTO reservations (reservation_id, account_id, consent_id, agent_id,"
+                " offer_id, amount_paise, status, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'held', ?, ?)"
+                " ON CONFLICT (offer_id) DO NOTHING",
+                (
+                    reservation_id,
+                    account_id,
+                    consent_id,
+                    agent_id,
+                    offer_id,
+                    amount,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            if claimed.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT * FROM reservations WHERE offer_id = ?", (offer_id,)
+                ).fetchone()
+                if existing is not None:
+                    return existing
+                raise AuthorityError(
+                    "reservation_failed",
+                    f"could not reserve against offer {offer_id}",
+                )
+
+            if backing == CREDIT:
+                # No balance to draw down. The ceiling is the limit minus what
+                # is already held or captured, evaluated in the same statement
+                # that increments the hold.
+                moved = conn.execute(
+                    "UPDATE authority_accounts"
+                    "   SET reserved_paise = reserved_paise + ?, updated_at = ?"
+                    " WHERE account_id = ? AND status = 'active'"
+                    "   AND (reserved_paise + captured_paise - refunded_paise + ?)"
+                    "       <= credit_limit_paise",
+                    (amount, utc_now(), account_id, amount),
+                )
+            else:
+                moved = conn.execute(
+                    "UPDATE authority_accounts"
+                    "   SET available_paise = available_paise - ?,"
+                    "       reserved_paise = reserved_paise + ?,"
+                    "       updated_at = ?"
+                    " WHERE account_id = ? AND status = 'active' AND available_paise >= ?",
+                    (amount, amount, utc_now(), account_id, amount),
+                )
+
+            if moved.rowcount == 0:
+                # The hold did not happen, so the reservation row must not
+                # survive. Deleting a row this transaction itself inserted a
+                # moment ago is not destroying history — nothing outside this
+                # transaction has ever seen it.
+                conn.execute(
+                    "DELETE FROM reservations WHERE reservation_id = ?", (reservation_id,)
+                )
+                account = conn.execute(
+                    "SELECT * FROM authority_accounts WHERE account_id = ?", (account_id,)
+                ).fetchone()
+                if account is None:
+                    raise AuthorityError(
+                        "no_authority_account",
+                        f"consent {consent_id} has no authority account",
+                    )
+                if account["status"] != "active":
+                    raise AuthorityError(
+                        "authority_account_inactive",
+                        f"authority account is {account['status']}",
+                        accountStatus=account["status"],
+                    )
+                if backing == CREDIT:
+                    used = (
+                        account["reserved_paise"]
+                        + account["captured_paise"]
+                        - account["refunded_paise"]
+                    )
+                    raise AuthorityError(
+                        "credit_limit_exceeded",
+                        f"{amount} paise would take exposure to {used + amount} paise, "
+                        f"over the credit limit of {credit_limit_paise} paise",
+                        exposurePaise=used,
+                        creditLimitPaise=credit_limit_paise,
+                    )
+                raise AuthorityError(
+                    "insufficient_authority",
+                    f"{amount} paise exceeds the {account['available_paise']} paise "
+                    "available. Top up the authority account, or fetch something cheaper.",
+                    availablePaise=account["available_paise"],
+                    amountPaise=amount,
+                )
+
+            return conn.execute(
+                "SELECT * FROM reservations WHERE reservation_id = ?", (reservation_id,)
+            ).fetchone()
+
+    def capture_reservation(
+        self, *, reservation_id: str, commitment_id: str
+    ) -> bool:
+        """Converts a held reservation into captured usage, exactly once.
+
+        Called after the content was actually delivered. The conditional
+        `WHERE status = 'held'` is what makes it exactly-once: a second call
+        moves no rows and returns False, so a retried settlement cannot
+        capture the same authority twice.
+
+        Both the reservation and the account move in one transaction, so the
+        invariant `funded = available + reserved + captured - refunded` is
+        never observably violated.
+        """
+        now = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            claimed = conn.execute(
+                "UPDATE reservations"
+                "   SET status = 'captured', resolved_at = ?, commitment_id = ?"
+                " WHERE reservation_id = ? AND status = 'held'",
+                (now, commitment_id, reservation_id),
+            )
+            if claimed.rowcount == 0:
+                return False
+
+            row = conn.execute(
+                "SELECT account_id, amount_paise FROM reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE authority_accounts"
+                "   SET reserved_paise = reserved_paise - ?,"
+                "       captured_paise = captured_paise + ?,"
+                "       updated_at = ?"
+                " WHERE account_id = ?",
+                (row["amount_paise"], row["amount_paise"], now, row["account_id"]),
+            )
+            return True
+
+    def release_reservation(self, *, reservation_id: str, reason: str = "released") -> bool:
+        """Returns held authority when fulfillment did not happen.
+
+        The counterpart to capture, and the reason a failed request does not
+        silently consume an agent's balance for the rest of the day.
+        """
+        now = utc_now()
+        status = "expired" if reason == "expired" else "released"
+        with _WRITE_LOCK, self._connect() as conn:
+            claimed = conn.execute(
+                "UPDATE reservations SET status = ?, resolved_at = ?"
+                " WHERE reservation_id = ? AND status = 'held'",
+                (status, now, reservation_id),
+            )
+            if claimed.rowcount == 0:
+                return False
+
+            row = conn.execute(
+                "SELECT account_id, amount_paise FROM reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE authority_accounts"
+                "   SET available_paise = available_paise + ?,"
+                "       reserved_paise = reserved_paise - ?,"
+                "       updated_at = ?"
+                " WHERE account_id = ?",
+                (row["amount_paise"], row["amount_paise"], now, row["account_id"]),
+            )
+            return True
+
+    def get_reservation_by_offer(self, offer_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM reservations WHERE offer_id = ?", (offer_id,)
+            ).fetchone()
+
+    def expire_stale_reservations(self, *, now: str | None = None) -> int:
+        """Sweeps held reservations past their TTL, returning the authority.
+
+        Without this, a request that dies between reserving and settling
+        strands an agent's balance until someone notices. Returns how many
+        were swept, so a scheduler can report it rather than sweeping
+        silently.
+        """
+        cutoff = now or utc_now()
+        with self._connect() as conn:
+            stale = conn.execute(
+                "SELECT reservation_id FROM reservations"
+                " WHERE status = 'held' AND expires_at <= ?",
+                (cutoff,),
+            ).fetchall()
+
+        swept = 0
+        for row in stale:
+            if self.release_reservation(
+                reservation_id=row["reservation_id"], reason="expired"
+            ):
+                swept += 1
+        return swept
 
     def committed_against_consent(self, *, consent_id: str, settle_date: str) -> int:
         """What has already been committed under one consent, on one date.

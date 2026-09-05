@@ -148,7 +148,7 @@ async function init() {
     return;
   }
 
-  await Promise.all([loadResources(), loadStatusChips()]);
+  await Promise.all([loadResources(), loadStatusChips(), loadSecurityProfile()]);
   wireButtons();
   await refreshDashboard();
   startLiveFeed();
@@ -195,6 +195,75 @@ async function loadStatusChips() {
     document.getElementById("chip-settlement").textContent = `${kind.extra.settlementMode} settlement`;
   } catch {
     showOfflineBanner();
+  }
+}
+
+// Which security controls this deployment is running open.
+//
+// Each entry pairs the flag name the facilitator reports with what it means in
+// plain terms and what the closed default actually is. The "closed" text is
+// the point: "trust-on-first-use is on" tells a reader nothing unless they
+// also learn that the alternative exists and is the default.
+const RELAXATION_LABELS = {
+  DEMO_OPEN_DASHBOARD: {
+    open: "Dashboard reads answer without an API key",
+    closed: "Production requires a scoped operator or merchant key",
+  },
+  DEMO_UNSAFE_TOFU: {
+    open: "Any caller can bind a key to an unclaimed agent id by being first",
+    closed: "Production needs an authenticated operator and a signed challenge",
+  },
+  ALLOW_HMAC_FALLBACK: {
+    open: "Unregistered agents may pay with a shared-secret MAC",
+    closed: "Production requires a registered Ed25519 key",
+  },
+  REQUIRE_CONSENT_DISABLED: {
+    open: "Agents can spend with no operator behind them",
+    closed: "Production requires an operator consent with limits",
+  },
+  AUTHORITY_REQUIRED_DISABLED: {
+    open: "Content is released without reserving authority first",
+    closed: "Production holds the amount against a real balance before serving",
+  },
+};
+
+async function loadSecurityProfile() {
+  const el = document.getElementById("profile-body");
+  try {
+    const health = await fetchJson(`${state.facilitatorUrl}/health`);
+    const profile = health.securityProfile;
+
+    if (!profile) {
+      el.innerHTML = '<p class="muted">This facilitator does not report a security profile.</p>';
+      return;
+    }
+
+    if (!profile.relaxed.length) {
+      el.innerHTML =
+        '<p class="profile__ok">✓ Running the production-like profile — every control closed.</p>';
+      return;
+    }
+
+    const rows = profile.relaxed
+      .map((flag) => {
+        const label = RELAXATION_LABELS[flag] || { open: flag, closed: "" };
+        return (
+          `<li class="profile__item">` +
+          `<span class="profile__flag">${escapeHtml(flag)}</span>` +
+          `<span class="profile__open">${escapeHtml(label.open)}</span>` +
+          `<span class="profile__closed">Closed by default: ${escapeHtml(label.closed)}</span>` +
+          `</li>`
+        );
+      })
+      .join("");
+
+    el.innerHTML =
+      `<p class="profile__warn">This demo runs <strong>${profile.relaxed.length}</strong> ` +
+      `security control${profile.relaxed.length === 1 ? "" : "s"} open, so anyone can click it ` +
+      `without an API key. Each one is closed in the production-like default.</p>` +
+      `<ul class="profile__list">${rows}</ul>`;
+  } catch {
+    el.innerHTML = '<p class="muted">Could not read the facilitator\'s configuration.</p>';
   }
 }
 
@@ -933,16 +1002,19 @@ function renderEconomics(econ) {
   const charges = econ.commitmentCount - econ.gatewayCallsSaved;
   const unreachable = econ.revenueUnreachablePerRequestPaise;
 
-  let html = `<p class="econ-headline"><span class="num">${econ.commitmentCount}</span> requests collected in <span class="num">${charges}</span> gateway charge${charges === 1 ? "" : "s"}.</p>`;
+  // "billed in", not "collected in". A gateway charge is an invoice; the
+  // collected figure lives in the tile above and is a different number for
+  // most of the day.
+  let html = `<p class="econ-headline"><span class="num">${econ.commitmentCount}</span> requests billed in <span class="num">${charges}</span> gateway charge${charges === 1 ? "" : "s"}.</p>`;
 
   if (unreachable > 0) {
     html +=
       `<p class="econ-headline">${paise(unreachable)} of ${paise(econ.totalPaise)} could not have been ` +
       `collected per-request — ${econ.belowGatewayMinimum} charge${econ.belowGatewayMinimum === 1 ? "" : "s"} ` +
-      `sit under Razorpay's ${paise(econ.gatewayMinimumPaise)} minimum.</p>`;
+      `sit under the Razorpay Payment Links ${paise(econ.gatewayMinimumPaise)} minimum.</p>`;
   } else {
     html +=
-      `<p class="econ-row">Every charge here clears the ${paise(econ.gatewayMinimumPaise)} gateway minimum — ` +
+      `<p class="econ-row">Every charge here clears the ${paise(econ.gatewayMinimumPaise)} Payment Links minimum — ` +
       `batching saves API calls and reconciliation rather than fees.</p>`;
   }
 

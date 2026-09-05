@@ -39,10 +39,17 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import authority
 import consent
+from authority import (
+    DEFAULT_RESERVATION_TTL_SECONDS,
+    AuthorityError,
+    PublisherPolicy,
+)
 from consent import ConsentDenied
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -117,15 +124,31 @@ DEFERRED_EXTENSION_ID = "in.bharatx402.deferred-settlement/v1"
 # Whether a request must hold reserved authority before content is released.
 # Phase 3 makes this meaningful; declared here so /supported can advertise it
 # from the start rather than changing shape later.
-AUTHORITY_REQUIRED = os.getenv("AUTHORITY_REQUIRED", "false").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
-
 def _flag(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
+
+
+# Whether an amount must be RESERVED against a real authority balance before
+# content is released.
+#
+# DEFAULT IS ON, and this is the Phase 3 thesis. A consent is a statement of
+# permission; it says nothing about whether anything stands behind the spend.
+# A consent for ₹50,000 written by an operator with nothing behind it
+# authorises exactly as much content as one backed by funds.
+#
+# With this on, the facilitator holds the quoted amount against an authority
+# account before the publisher's handler runs, and converts it to a receivable
+# only once the content was actually delivered. Content is released against a
+# reservation — not against a signature, and not against a promise.
+AUTHORITY_REQUIRED = _flag("AUTHORITY_REQUIRED", "true")
+
+# How long a hold survives without being captured or released. The x402
+# middleware runs verify -> handler -> settle inside one HTTP request, so the
+# realistic window is seconds; this is the backstop for a request that dies in
+# between, swept by scheduler.py.
+RESERVATION_TTL_SECONDS = int(
+    os.getenv("RESERVATION_TTL_SECONDS", str(DEFAULT_RESERVATION_TTL_SECONDS))
+)
 
 
 # Whether the *public dashboard reads* — /ledger/summary, /economics,
@@ -194,6 +217,15 @@ ALLOW_HMAC_FALLBACK = os.getenv("ALLOW_HMAC_FALLBACK", "false").strip().lower() 
 # Unset means the webhook endpoint refuses every delivery rather than
 # accepting unauthenticated ledger writes — see webhooks.py.
 RAZORPAY_WEBHOOK_SECRET = (os.getenv("RAZORPAY_WEBHOOK_SECRET") or "").strip()
+
+# What THIS publisher will serve content against — the fourth policy layer
+# (see consent.py). Distinct from the operator's consent and the facilitator's
+# risk ceiling because it answers a different party's question: the operator
+# decides what its agent may spend, the platform decides how much exposure it
+# will carry overall, and this decides what this publisher will hand content
+# over for. A newspaper happy to invoice later and an API that serves only
+# against prefunded balance are both reasonable and need different settings.
+PUBLISHER_POLICY = PublisherPolicy.from_env(os.environ)
 
 OFFER_POLICY = OfferPolicy(
     ttl_seconds=int(os.getenv("OFFER_TTL_SECONDS", "300")),
@@ -410,13 +442,7 @@ if FACILITATOR_STARTUP_CHECK:
         # long after the migration finished, because nothing ever said so. A
         # deployment that is running open now has to say it out loud, once per
         # boot, in the same structured log everything else goes to.
-        relaxed = {
-            "DEMO_OPEN_DASHBOARD": DEMO_OPEN_DASHBOARD,
-            "DEMO_UNSAFE_TOFU": DEMO_UNSAFE_TOFU,
-            "ALLOW_HMAC_FALLBACK": ALLOW_HMAC_FALLBACK,
-            "REQUIRE_CONSENT_DISABLED": not REQUIRE_CONSENT,
-        }
-        enabled = sorted(name for name, on in relaxed.items() if on)
+        enabled = _relaxed_flags()
         if enabled:
             ledger.log_event(
                 "insecure_demo_mode_enabled",
@@ -792,6 +818,45 @@ def verify(request: X402Request) -> JSONResponse:
             },
         )
 
+    # Authority, held before the publisher's handler produces anything.
+    #
+    # /verify is the only hook the middleware gives us before the handler
+    # runs, and "before the content exists" is the requirement. Consent is
+    # re-evaluated here too: /offer checked it, but that was a different HTTP
+    # request and a consent can be revoked in between.
+    try:
+        _, verify_consent_id = _authorize_spend(
+            agent_id=result["agentId"], amount_paise=result["amountPaise"]
+        )
+        _reserve_authority(
+            agent_id=result["agentId"],
+            consent_id=verify_consent_id,
+            offer_id=result["offerId"],
+            amount_paise=result["amountPaise"],
+        )
+    except ConsentDenied as exc:
+        ledger.log_event(
+            "verify_refused_by_consent",
+            agent_id=result["agentId"],
+            amount_paise=result["amountPaise"],
+            status="rejected",
+            reason=exc.reason,
+            message=exc.message,
+            **exc.detail,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "isValid": False,
+                "invalidReason": exc.reason,
+                "invalidMessage": exc.message,
+            },
+        )
+    except AuthorityError as exc:
+        return _authority_refusal(
+            exc, agent_id=result["agentId"], amount_paise=result["amountPaise"]
+        )
+
     ledger.log_event(
         "payment_verified",
         agent_id=result["agentId"],
@@ -870,6 +935,106 @@ def _authorize_spend(*, agent_id: str, amount_paise: int) -> tuple[str | None, s
         ),
     )
     return decision.operator_id, decision.consent_id
+
+
+def _reserve_authority(
+    *, agent_id: str, consent_id: str | None, offer_id: str, amount_paise: int
+) -> Mapping[str, Any] | None:
+    """Holds the quoted amount against the agent's authority, before fulfillment.
+
+    Called from `/verify`, which is the only hook the x402 middleware gives us
+    *before* the publisher's handler runs — and "before the content exists" is
+    the whole requirement. `/settle` is too late: by then the response has been
+    produced and buffered.
+
+    ON /verify HAVING A SIDE EFFECT: it previously had none beyond the audit
+    log, and its docstring said so, because the middleware may call it
+    speculatively. That is preserved in the way that matters — the reservation
+    is idempotent on `offer_id` (UNIQUE), so calling /verify five times holds
+    one amount, not five. What it is *not* is free: a speculative verify now
+    holds authority until the request completes or the sweeper expires it.
+    That is the cost of not serving content against a promise, and it is
+    bounded by RESERVATION_TTL_SECONDS.
+
+    Args:
+        agent_id: Who is spending.
+        consent_id: The consent to draw against, or None under the legacy path.
+        offer_id: The quote being spent. Also the idempotency key.
+        amount_paise: Integer paise to hold.
+
+    Returns:
+        The reservation row, or None when authority is not required and none
+        exists.
+
+    Raises:
+        AuthorityError: If there is no account, not enough authority, or this
+            publisher will not serve against what backs it.
+    """
+    if consent_id is None:
+        if AUTHORITY_REQUIRED:
+            raise AuthorityError(
+                "no_authority",
+                f"agent {agent_id} has no consent, so there is no authority to reserve "
+                "against. Content is not released on an unbacked promise.",
+            )
+        return None
+
+    account = ledger.get_authority_account(consent_id=consent_id)
+    if account is None:
+        if AUTHORITY_REQUIRED:
+            raise AuthorityError(
+                "no_authority_account",
+                f"consent {consent_id} has no authority account. An operator must fund "
+                "one, or set a credit limit, before this agent can be served.",
+            )
+        return None
+
+    snapshot = authority.snapshot_from_row(account)
+
+    # The publisher's own acceptance policy, checked BEFORE the hold. Refusing
+    # after reserving would take an agent's authority for a request that was
+    # never going to be served.
+    PUBLISHER_POLICY.check(snapshot, amount_paise=amount_paise)
+
+    return ledger.reserve_authority(
+        reservation_id=f"rsv_{uuid.uuid4().hex[:20]}",
+        account_id=account["account_id"],
+        consent_id=consent_id,
+        agent_id=agent_id,
+        offer_id=offer_id,
+        amount_paise=amount_paise,
+        ttl_seconds=RESERVATION_TTL_SECONDS,
+        backing=account["backing"],
+        credit_limit_paise=account["credit_limit_paise"],
+    )
+
+
+def _authority_refusal(
+    exc: AuthorityError, *, agent_id: str, amount_paise: int
+) -> JSONResponse:
+    """Records and renders an authority refusal in the x402 failure shape."""
+    ledger.log_event(
+        "authority_refused",
+        agent_id=agent_id,
+        amount_paise=amount_paise,
+        status="rejected",
+        reason=exc.reason,
+        message=exc.message,
+        **exc.detail,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "isValid": False,
+            "invalidReason": exc.reason,
+            "invalidMessage": exc.message,
+            "success": False,
+            "errorReason": exc.reason,
+            "errorMessage": exc.message,
+            "transaction": "",
+            "network": X402_NETWORK,
+        },
+    )
 
 
 def _consent_refusal(exc: ConsentDenied, *, agent_id: str, amount_paise: int) -> JSONResponse:
@@ -963,6 +1128,18 @@ def settle(request: X402Request) -> JSONResponse:
     offer_id = payload.get("offerId")
 
     def failure(reason: str, message: str, agent_id: str | None = None) -> JSONResponse:
+        # Fulfillment did not produce a receivable, so any authority held for
+        # this offer goes back immediately rather than waiting for the
+        # sweeper. Without this, every refused settlement would strand an
+        # agent's balance for the whole TTL — turning one rejected request
+        # into a self-inflicted outage for the next several.
+        if offer_id:
+            held = ledger.get_reservation_by_offer(offer_id)
+            if held is not None and held["status"] == "held":
+                ledger.release_reservation(
+                    reservation_id=held["reservation_id"], reason="released"
+                )
+
         ledger.log_event(
             "payment_settle_rejected",
             agent_id=agent_id or payload.get("agentId"),
@@ -1099,6 +1276,20 @@ def settle(request: X402Request) -> JSONResponse:
 
     if SETTLEMENT_MODE == "per_request":
         return _settle_immediately(commitment)
+
+    # Capture: the content was delivered, so the hold becomes a receivable.
+    #
+    # Exactly once, enforced by `WHERE status = 'held'` — a retried settlement
+    # moves no rows and captures nothing a second time. Ordering matters: the
+    # commitment is booked first, so a capture that fails leaves a receivable
+    # with a still-held reservation (visible, recoverable by the sweeper)
+    # rather than consumed authority with no debt recorded against it.
+    reservation = ledger.get_reservation_by_offer(result["offerId"])
+    if reservation is not None:
+        ledger.capture_reservation(
+            reservation_id=reservation["reservation_id"],
+            commitment_id=commitment["commitmentId"],
+        )
 
     ledger.log_event(
         "commitment_recorded",
@@ -1609,6 +1800,23 @@ def settle_batch(request: BatchRequest, http_request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _relaxed_flags() -> list[str]:
+    """Which security controls are currently open.
+
+    One definition, used by both the startup log and /health — two lists that
+    could disagree about what "running open" means would be worse than one
+    that is occasionally incomplete.
+    """
+    relaxed = {
+        "DEMO_OPEN_DASHBOARD": DEMO_OPEN_DASHBOARD,
+        "DEMO_UNSAFE_TOFU": DEMO_UNSAFE_TOFU,
+        "ALLOW_HMAC_FALLBACK": ALLOW_HMAC_FALLBACK,
+        "REQUIRE_CONSENT_DISABLED": not REQUIRE_CONSENT,
+        "AUTHORITY_REQUIRED_DISABLED": not AUTHORITY_REQUIRED,
+    }
+    return sorted(name for name, on in relaxed.items() if on)
+
+
 def _authorize_read(authorization: str | None, scope: str) -> control_plane.Principal | None:
     """Gates a dashboard read.
 
@@ -1841,6 +2049,22 @@ def health() -> JSONResponse:
         "settlementInstrument": gateway.instrument,
         "proofScheme": ALGORITHM,
         "hmacFallbackAllowed": ALLOW_HMAC_FALLBACK,
+        # The security profile, published rather than merely logged.
+        #
+        # The hosted demo runs several controls open so a stranger with no API
+        # key can click it. Reporting that only in a startup log line means the
+        # people looking at the demo — the ones who most need to know it is not
+        # the production configuration — never see it. So the console renders
+        # this, and every relaxation is visible on the page itself.
+        "securityProfile": {
+            "profile": "demo" if _relaxed_flags() else "production-like",
+            "relaxed": _relaxed_flags(),
+            "dashboardReadsOpen": DEMO_OPEN_DASHBOARD,
+            "trustOnFirstUseEnabled": DEMO_UNSAFE_TOFU,
+            "consentRequired": REQUIRE_CONSENT,
+            "authorityRequired": AUTHORITY_REQUIRED,
+            "publisherPolicy": PUBLISHER_POLICY.describe(),
+        },
     }
     return JSONResponse(status_code=200 if ledger_ok else 503, content=body)
 

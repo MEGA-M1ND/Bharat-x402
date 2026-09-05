@@ -89,12 +89,13 @@ def _reset_postgres_ledger(dsn: str) -> None:
         conn.execute(
             "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events,"
             " operators, merchants, api_credentials, agent_credentials,"
-            " enrollment_challenges, spending_consents, consent_publishers"
+            " enrollment_challenges, spending_consents, consent_publishers,"
+            " authority_accounts, reservations"
             " RESTART IDENTITY CASCADE"
         )
 
 
-# The four switches whose *production* default is closed, and which the bulk
+# The five switches whose *production* default is closed, and which the bulk
 # of this suite predates.
 #
 # Phase 2 changed each of these defaults from permissive to secure:
@@ -108,6 +109,9 @@ def _reset_postgres_ledger(dsn: str) -> None:
 #                         operator and proof of possession.
 #   REQUIRE_CONSENT       an agent could spend with no operator behind it.
 #                         A consent is now required to incur any expense.
+#   AUTHORITY_REQUIRED    content was released against a promise. An amount
+#                         must now be reserved against a real authority
+#                         balance before the handler runs.
 #
 # The existing tests exercise the *payment flow* — negotiation, double-spend,
 # batching, webhooks — and are not about authorization. Rewriting all of them
@@ -123,10 +127,13 @@ LEGACY_DEMO_PROFILE = {
     "DEMO_OPEN_DASHBOARD": "true",
     "ALLOW_HMAC_FALLBACK": "true",
     "DEMO_UNSAFE_TOFU": "true",
-    # An agent with no operator consent may still spend. The fourth switch,
-    # and the one that matters most: with it on, /offer and /settle refuse any
-    # agent that no operator has authorised.
+    # An agent with no operator consent may still spend. With it on, /offer
+    # and /settle refuse any agent that no operator has authorised.
     "REQUIRE_CONSENT": "false",
+    # Content may be released without an amount being held against an
+    # authority balance first. The last switch, and the one that separates
+    # "you are allowed to" from "something stands behind it".
+    "AUTHORITY_REQUIRED": "false",
 }
 
 
@@ -136,7 +143,7 @@ def legacy_demo_profile(request, monkeypatch):
 
     Mark a test or class with `@pytest.mark.secure_defaults` to get the
     production configuration instead — closed dashboard, no HMAC fallback, no
-    trust-on-first-use, and consent required.
+    trust-on-first-use, and both consent and reserved authority required.
     """
     if request.node.get_closest_marker("secure_defaults"):
         # Explicitly clear rather than merely not setting them: a stray value

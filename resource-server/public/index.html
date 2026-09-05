@@ -205,6 +205,25 @@
           <p class="muted">Fetch the ₹0.50 API call a few times to see this fill in.</p>
         </div>
       </div>
+
+      <!--
+        The demo runs several security controls open so a stranger with no API
+        key can click it. Reporting that only in a startup log means the people
+        looking at the demo — the ones who most need to know this is not the
+        production configuration — never see it. So it is rendered here, on the
+        page, naming each relaxation.
+      -->
+      <div class="card card--profile">
+        <div class="card__head">
+          <h3>How this deployment is configured</h3>
+          <p class="card__sub">
+            What is switched off here, and what the production-like default is.
+          </p>
+        </div>
+        <div id="profile-body">
+          <p class="muted">Checking…</p>
+        </div>
+      </div>
     </section>
 
   </main>

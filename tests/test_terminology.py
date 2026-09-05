@@ -198,9 +198,19 @@ class TestClaimsAreScoped:
         about NPCI rails — and Reserve Pay's own ₹10,000 block ceiling is a
         different limit entirely.
         """
+        # Two shapes, because the literal figure is not always in the source.
+        #
+        # The second pattern exists because of a real miss: the console builds
+        # its economics copy at runtime — `Razorpay's ${paise(min)} minimum` —
+        # so the string "₹1.00 minimum" never appears in any file, and the
+        # first pattern sailed straight past an unscoped claim that was
+        # rendering on the page. A screenshot caught it; this test now does.
         mentions_floor = re.compile(
             r"(?:₹\s?1(?:\.00)?|\b100\s+paise\b)\s*(?:gateway\s+)?(?:floor|minimum)"
-            r"|minimum\s+(?:charge\s+)?(?:of\s+)?₹\s?1\b",
+            r"|minimum\s+(?:charge\s+)?(?:of\s+)?₹\s?1\b"
+            # `(?![A-Za-z])` keeps this off identifiers — `RazorpayConfigError`
+            # is a class name, not a claim about a payment product.
+            r"|Razorpay(?:'s|’s)?(?![A-Za-z])[^.\n]{0,60}?\b(?:floor|minimum)\b",
             re.IGNORECASE,
         )
         scopes_it = re.compile(r"payment\s*links?", re.IGNORECASE)
