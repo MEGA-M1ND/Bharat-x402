@@ -119,14 +119,20 @@ it cannot creep back.
 
 The real barriers to per-request INR settlement, in order of how much they bite:
 
-**1. The gateway minimum.** Razorpay will not process an order below ₹1.00. A ₹0.50 API
-call is not *expensive* to settle individually — it is *impossible*. Sub-rupee is exactly
-where agent API pricing wants to sit, so batching is not an optimisation here. It is what
-makes the price point exist at all.
+**1. The gateway minimum.** The Razorpay **Payment Links** API will not accept an amount
+below ₹1.00. A ₹0.50 API call is not *expensive* to settle individually — it is
+*impossible*. Sub-rupee is exactly where agent API pricing wants to sit, so batching is
+not an optimisation here. It is what makes the price point exist at all.
 
-This is verified against Razorpay's live test API rather than taken from documentation.
+Scope, because it matters: this is a **Payment Links** limit. Razorpay's documentation for
+that endpoint words it as `amount should be minimum 100 for INR`. It is not a claim about
+every Razorpay product, about UPI, or about NPCI rails — UPI Reserve Pay, for instance,
+carries an entirely different published limit (a ₹10,000 block ceiling). See
+[research-sources.md](research-sources.md).
+
+The documented rule was also checked against the live test API rather than taken on trust.
 Posting the two amounts directly to `POST /v1/payment_links`, bypassing this project's own
-guard:
+guard, returns the rupee-formatted variant of the same rule:
 
 ```
 Rs 0.50 (50 paise)    REJECTED 400 -> "amount: amount should be minimum 1.00 for INR."
@@ -288,12 +294,15 @@ mostly this list.
 | Area | Here | Production |
 | --- | --- | --- |
 | **Payment proofs** | **Ed25519 per agent** — the agent signs with a key the facilitator does not hold, so a commitment is evidence rather than a checksum. The offer signature stays HMAC on purpose: there the facilitator is both signer and only verifier. | Same primitive. What changes is key *distribution*, below. |
-| **Agent identity** | Trust-on-first-use: the first caller to claim an agent id owns it. Rebinding to a different key is refused, so rotation and takeover are not the same request. | Keys issued at onboarding, bound to the merchant account that settles, with rate limits and per-agent spending caps. An authenticated channel for rotation. |
-| **Legacy proofs** | HMAC fallback still accepted from agents with no registered key (`ALLOW_HMAC_FALLBACK`), every use logged as a downgrade | Fallback off. Registration mandatory — the suite already covers that end state. |
+| **Agent identity** | **Authenticated operator enrollment**: an operator asks for a nonce, the agent signs it with the key being enrolled, and only a valid signature binds it. Credentials are rows with validity windows, so revoking one stops new authorization without invalidating past evidence. Trust-on-first-use survives only behind `DEMO_UNSAFE_TOFU`, off by default. | Same, plus KYC — an operator here is a row with a display name, and nothing binds it to a legal entity you could invoice. |
+| **Spending authority** | **Operator consent** with per-request, daily and lifetime limits in integer paise, a publisher scope, and instant revocation — plus an authority balance the amount is *reserved* against before content is released. | Same shape, backed by a real UPI Reserve Pay block rather than a simulated one. |
+| **Operational endpoints** | **Scoped API keys**, hashed at rest, with the tenant resolved from the key rather than a query parameter. Four planes: public protocol, gateway callback, agent-authorized, operator/merchant control. | Same, plus key rotation policy, audit export, and rate limiting per tenant. |
+| **Legacy proofs** | HMAC fallback **off by default** (`ALLOW_HMAC_FALLBACK=false`); every use logged as a downgrade where a demo turns it on | Fallback removed entirely. |
 | **Settlement instrument** | One-off Payment Link per agent per day | UPI **Reserve Pay** (SBMD) consent, debited as usage accrues. Removes the hosted checkout page from a machine-to-machine flow entirely. Not Autopay — see above. |
 | **`payTo`** | Opaque string | Validated Razorpay account, with a real publisher onboarding flow |
 | **Ledger** | SQLite locally, Postgres in production, behind `db.py`'s dialect shim; the whole suite runs on both in CI | Same, plus the commitment table partitioned by settlement date |
-| **Batch failure** | Commitments stay pending, retried next run. An expired or cancelled link returns its commitments to the queue via webhook. | Dead-letter queue, alerting, partial-batch recovery, reconciliation against Razorpay's own settlement reports |
+| **Batch failure** | Commitments stay pending, retried next run. An expired or cancelled link returns its commitments to the queue via webhook. | Dead-letter queue, alerting, partial-batch recovery, reconciliation against Razorpay's own settlement reports. **Not built yet — Phase 5.** |
+| **Accounting** | **Double-entry journal**: every money-changing operation posts balanced debits and credits, idempotent on a deterministic command reference, and nothing is ever updated or deleted — errors are compensated. Refund allocation is integer-exact, property-tested. | Same, plus revenue recognition timing, GST and TDS, and statutory reporting. The account names here borrow the vocabulary without claiming the compliance. |
 | **Replay protection** | Single-use offers with expiry; webhook deliveries deduplicated on a primary key | Same, plus a distributed nonce cache so multiple facilitator instances agree |
 | **Payment confirmation** | **Signature-verified `payment_link.paid` webhook**, exactly-once, moving a batch from `created` to `paid`. `committedPaise` and `collectedPaise` are reported separately. | Same, plus periodic reconciliation against settlement reports to catch webhooks that never arrived at all |
 | **Secrets** | `.env` files. The facilitator holds no agent private keys — only public ones. | A secret manager for the remaining symmetric secrets (offer signing, webhook verification) |
@@ -307,3 +316,5 @@ mostly this list.
 - A hard refusal to start on an `rzp_live_` key, not overridable by config.
 - Structured audit logging of every rejection with a distinct reason code.
 - Fail-closed paywalling: if settlement is unavailable the resource server returns 503, never the content.
+- Content released only against a **reserved** amount, held by a conditional UPDATE so two concurrent requests cannot overspend one balance — proven with threads, on both engines.
+- Committed and collected reported as separate figures, everywhere, including on the dashboard and in the publisher's digest.
