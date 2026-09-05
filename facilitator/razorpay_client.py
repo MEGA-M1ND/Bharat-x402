@@ -19,10 +19,16 @@ fee it does not, and anyone at a payments company will spot that immediately:
 The real barriers to per-request INR settlement are these, in order of how
 much they actually bite:
 
-  1. **The gateway minimum.** Razorpay will not process an order below ₹1.00.
-     A ₹0.50 API call is not expensive to settle individually — it is
-     *impossible*. Batching is what makes sub-rupee pricing exist at all, and
-     sub-rupee is exactly where agent API pricing wants to sit.
+  1. **The gateway minimum.** The Razorpay Payment Links API will not accept
+     an amount below ₹1.00 — the docs word it as "minimum 100 for INR", and
+     posting 50 paise to the test API returns exactly that rejection. A ₹0.50
+     API call is not expensive to settle individually — it is *impossible*.
+     Batching is what makes sub-rupee pricing exist at all, and sub-rupee is
+     exactly where agent API pricing wants to sit.
+
+     Scope: this is a Payment Links limit, observed and documented for that
+     product. It is not a claim about every Razorpay product, about UPI, or
+     about NPCI rails. See docs/research-sources.md.
 
   2. **Checkout has a human in it.** A Payment Link is a hosted page somebody
      opens and pays on. You cannot put that in the path of an HTTP request an
@@ -81,7 +87,7 @@ class FeeModel:
         fixed_paise: Flat per-transaction component, in paise.
         gst_bps: Tax applied to the fee itself. 1800 = 18%.
         minimum_charge_paise: Smallest amount the gateway will accept.
-            Razorpay's documented floor is ₹1.00.
+            The Razorpay Payment Links API's documented floor is ₹1.00.
     """
 
     percent_bps: int = 200
@@ -179,7 +185,7 @@ def estimate_settlement_cost(amounts_paise: list[int], model: FeeModel) -> dict:
             "A pure percentage fee is close to neutral on batching — 2% of many small "
             "charges is 2% of one large one, give or take rounding. Batching matters "
             f"because {len(unchargeable)} of {count} charges here fall under the "
-            f"{format_paise(model.minimum_charge_paise)} gateway minimum and have no "
+            f"{format_paise(model.minimum_charge_paise)} Payment Links minimum and have no "
             "per-request path at all, because any fixed fee component multiplies by N, "
             "and because hosted checkout cannot sit in the path of a machine-to-machine "
             "request."
@@ -333,7 +339,8 @@ class RazorpayGateway:
             works against Razorpay today.
           * `reserve_pay` — a simulated mandate debit. See reserve_pay.py for
             what it does and does not model, and why it is the right shape for
-            agent traffic even though it does not fix the ₹1 floor.
+            agent traffic even though it does not fix the ₹1 Payment Links
+            floor.
 
         Args:
             amount_paise: Total to charge.

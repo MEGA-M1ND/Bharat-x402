@@ -1,8 +1,9 @@
 # Bharat x402
 
-**An INR settlement facilitator for the x402 agent-payment protocol** — so Indian publishers can
-charge AI agents per request in rupees, through Razorpay, without touching stablecoin
-infrastructure.
+**An INR-oriented authorization, metering, credit-control, aggregation, and reconciliation layer
+for machine-priced HTTP access.** Agents negotiate through [x402](https://github.com/coinbase/x402);
+content is released against operator-backed authority; low-value usage accrues and is collected
+through a pluggable Razorpay-compatible settlement instrument.
 
 **▶ Live, clickable demo: [bharat-x402.vercel.app](https://bharat-x402.vercel.app)** — run the
 whole negotiation yourself, no install.
@@ -13,9 +14,19 @@ whole negotiation yourself, no install.
 | --- | --- |
 | Agent requests served in one run | **60**, across 5 crawler identities |
 | Razorpay charges that took | **5** — one Payment Link per agent, 55 gateway calls avoided |
-| Revenue **impossible** to collect per-request | **₹30.00 of ₹30.00** — every charge under Razorpay's ₹1.00 floor |
-| Razorpay's ₹1 floor | verified by posting 50 paise to the live test API, not read off a doc |
-| Tests | **217** — 207 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
+| Usage **impossible** to collect per-request | **₹30.00 of ₹30.00** — every charge under the Razorpay Payment Links ₹1.00 floor |
+| That ₹1 floor | Razorpay's Payment Links docs say `minimum 100 for INR`; we also posted 50 paise to the test API and kept the rejection |
+| Tests | **218** — 208 offline, 10 against live HTTP; full suite runs on SQLite *and* real Postgres in CI |
+
+> **Committed is not collected.** A completed request produces a *receivable*, not a payment. This
+> README says "accrued" where money is owed and "collected" only where a signature-verified
+> gateway confirmation says it arrived. The distinction is the point of the project, so it is
+> enforced by a test rather than by good intentions — see
+> [`tests/test_terminology.py`](tests/test_terminology.py).
+
+**Start here:** [domain model](docs/domain-model.md) · [threat model](docs/threat-model.md) ·
+[what's real vs simulated](docs/gap-analysis.md) · [primary sources](docs/research-sources.md) ·
+[the deferred x402 extension](docs/protocol-extension.md)
 
 ```
       key   agent-perplexity-bot
@@ -33,24 +44,62 @@ whole negotiation yourself, no install.
   CONTENT UNLOCKED — USD/INR spot rate
 ```
 
+`cmt_…` is a **commitment id — a receivable**. The x402 protocol calls the object a settlement
+receipt and this facilitator returns one, but no rupees have moved at this point and the publisher
+is carrying the credit. What the protocol means by `/settle`, and how a client discovers that
+without reading prose, is in [docs/protocol-extension.md](docs/protocol-extension.md).
+
 ---
 
 ## Why this exists
 
-x402 lets an AI agent pay per request for gated content over HTTP 402. Its reference
-implementation settles USDC on an EVM chain — the wrong currency and the wrong rail for an
-Indian publisher, and a compliance question they never asked for. So the practical answer to
-*"can Indian publishers monetise AI agent traffic with x402?"* has been *not without stablecoin
-infrastructure*, while agent traffic grows and none of it pays.
+**x402** — [authored by Coinbase](https://blog.cloudflare.com/x402/), now developed through the
+x402 Foundation that Coinbase and Cloudflare announced together — lets an AI agent pay per request
+for gated content over HTTP 402. Its reference implementation settles USDC on an EVM chain: the
+wrong currency and the wrong rail for an Indian publisher, and a compliance question they never
+asked for. So the practical answer to *"can Indian publishers monetise AI agent traffic with
+x402?"* has been *not without stablecoin infrastructure*, while agent traffic grows and none of it
+pays.
 
 But x402 is explicitly **facilitator-agnostic**: anything that can verify a payment payload and
-settle it can be a facilitator. This is that, for rupees. The publisher runs the stock
-`@x402/express` middleware, unmodified, and gets paid in INR.
+settle it can be a facilitator. Its v2 specification goes further than most readers expect —
+`asset` is documented as "token contract address **or ISO 4217 currency code for fiat**", and
+non-blockchain networks are told to use CAIP-2 form, `ach:us` and `sepa:eu` given as the examples.
+`razorpay:inr-test` is exactly that shape. Rupees are not a hack around the protocol; they are a
+case it anticipated.
 
-The hard part turned out not to be the protocol. It was that **Razorpay will not process an
-order below ₹1.00**, and agent API pricing wants to live well under that. So payments are
-recorded as commitments instantly and settled in one batched Payment Link later — which is what
-makes sub-rupee pricing possible at all.
+The hard part turned out not to be the protocol. It was that **the Razorpay Payment Links API will
+not accept an amount below ₹1.00**, and agent API pricing wants to live well under that. So usage
+is recorded as a commitment instantly and collected in one batched Payment Link later — which is
+what makes sub-rupee pricing possible at all.
+
+### And the part that took longer to admit
+
+A deferred commitment means **the content is served before the money moves**. The first version of
+this project called that a solved problem, because a signed commitment *looked* like proof of
+payment. It is not. It is proof that a key agreed to owe something.
+
+So the newer half of this repository is the machinery that makes deferral defensible rather than
+merely convenient: an operator who consents to spending and can revoke it, authority reserved
+atomically before content is released, a double-entry journal where nothing is ever overwritten,
+and a dashboard that shows outstanding exposure next to collected revenue instead of merging them.
+
+### What Cloudflare has to do with this — and what it doesn't
+
+Cloudflare's [Pay Per Crawl](https://developers.cloudflare.com/ai-crawl-control/features/pay-per-crawl/)
+is the clearest industry statement of the same problem, and it is worth being exact about the
+relationship, because an earlier version of this README got it wrong and called x402 "Cloudflare's
+protocol":
+
+- **x402 was authored by Coinbase.** Cloudflare co-founded the x402 Foundation with them.
+- **Pay Per Crawl is not x402.** It uses its own `crawler-price` / `crawler-max-price` /
+  `crawler-charged` headers and identifies crawlers with Web Bot Auth. Cloudflare's x402-based
+  product is the separate Monetization Gateway.
+- **Cloudflare is not a dependency here.** It motivates the use case. Nothing in this repository
+  needs it at runtime.
+
+Every external claim in this README is sourced in
+[docs/research-sources.md](docs/research-sources.md).
 
 ### How this relates to what Razorpay is already building
 
@@ -131,7 +180,15 @@ sequenceDiagram
     participant F as Bharat x402<br/>facilitator
     participant R as Razorpay
 
-    A->>F: POST /agents/register (Ed25519 public key, once)
+    participant O as Operator
+
+    Note over O,F: — once, authenticated —
+    O->>F: POST /control/agents/challenge
+    F-->>O: single-use nonce
+    O->>F: POST /control/agents/enroll (nonce signed by the agent key)
+    O->>F: POST /control/consents (limits in paise, publisher scope)
+    F-->>O: consent + authority account
+
     A->>P: GET /premium/api-call
     P-->>A: 402 · accepts[{razorpay-inr, 50 paise}]
     A->>F: POST /offer
@@ -139,17 +196,25 @@ sequenceDiagram
     Note over A: sign acceptance with<br/>its own private key
     A->>P: GET + X-PAYMENT
     P->>F: POST /verify
+    Note over F: consent checked,<br/>authority RESERVED
     F-->>P: isValid: true
     Note over P: handler runs,<br/>response buffered
     P->>F: POST /settle
+    Note over F: reservation captured,<br/>journal posts Dr receivable / Cr payable
     F-->>P: commitment cmt_… · no rupees moved
     P-->>A: 200 · content + receipt
     Note over F,R: — end of day —
     F->>R: ONE Payment Link for N commitments
     R-->>F: plink_…
     R->>F: webhook payment_link.paid (signed)
-    Note over F: batch → paid.<br/>Only now is it revenue.
+    Note over F: journal posts Dr clearing / Cr receivable.<br/>Only now is it collected.
 ```
+
+The two boxed steps are what changed. **The reservation is why content is
+released at all** — before it, a pseudonymous key promised to pay and the
+publisher took the promise. And `/settle` posts to a double-entry journal that
+credits *publisher payable*, not revenue: no money has arrived, and crediting
+revenue there would be this project's own argument made wrong, in accounts.
 
 ### This is a real x402 deployment, not a lookalike
 
@@ -401,8 +466,10 @@ plink_TOk8Af9Z4ofoHy   ₹10.00  created  batch_56e1ce6e4cc54b96  agent-perplexi
 plink_TOk8BAFzBoaOuk    ₹5.00  created  batch_8059ae0b56cf45a0  agent-pytest
 ```
 
-And the ₹1.00 floor this project is built around is not taken from documentation. Posting both
-amounts straight to `POST /v1/payment_links`, bypassing our own guard:
+And the ₹1.00 **Payment Links** floor this project is built around was not taken on trust.
+Razorpay's [Payment Links documentation](https://razorpay.com/docs/api/payments/payment-links/create-standard/)
+states `amount should be minimum 100 for INR`; posting both amounts straight to
+`POST /v1/payment_links`, bypassing our own guard, is what the test API actually returned:
 
 ```
 Rs 0.50 (50 paise)    REJECTED 400 -> "amount: amount should be minimum 1.00 for INR."
@@ -459,13 +526,22 @@ This is a portfolio demo, not a payment system.
   holding a key that can move real money.
 - It runs fully offline with `MOCK_RAZORPAY=true`, which is the default. Set your own
   `rzp_test_` keys and flip it to `false` to create real test-mode links.
-- **Agent identity is trust-on-first-use.** The first caller to claim an agent id owns it,
-  because there is nothing here to bind that id to. Production would issue the key at
-  onboarding, alongside the merchant account it settles into. Rebinding is refused rather than
-  allowed, so at least key rotation and account takeover are not the same request.
-- **The HMAC fallback is still on** (`ALLOW_HMAC_FALLBACK=true`) so unregistered agents keep
-  working during migration. Every fallback verification is logged as a downgrade. Turning it off
-  makes registration mandatory, and the suite covers that end state.
+- **The hosted demo runs five security controls open, and says so on the page.** A browser
+  cannot hold an API key, and the point of that deployment is that a stranger can click it —
+  so `DEMO_OPEN_DASHBOARD`, `DEMO_UNSAFE_TOFU`, `ALLOW_HMAC_FALLBACK`, `REQUIRE_CONSENT=false`
+  and `AUTHORITY_REQUIRED=false` are all set there. **Every one of them is closed by default.**
+  The facilitator logs `insecure_demo_mode_enabled` naming each at startup, `/health` publishes
+  the profile, and the console renders a card listing each relaxation next to what the
+  production-like default is — because reporting it only in a log means the people looking at
+  the demo never see it. `tests/test_control_plane.py` runs with all five cleared and asserts,
+  endpoint by endpoint, what a closed deployment refuses.
+- **There is no KYC.** An operator is a row with a display name. Ed25519 proves *key
+  continuity*, and an authenticated enrollment proves *possession* — neither proves anybody is
+  who they say they are, and nothing here binds an operator to a legal entity you could invoice.
+- **The authority balances are not money.** `prefunded` is a test-mode top-up, not a received
+  payment; `simulated_reserve` models UPI Reserve Pay's block/debit shape with no NPCI mandate
+  behind it and reports `"simulated": true` in its own payload. The *accounting* and the
+  concurrency guarantees are real; the funds are not.
 - **No UPI Reserve Pay integration** — it is in closed beta, so settlement here is Payment Links,
   which is why a human-facing checkout page still appears in a machine-to-machine flow.
 - **The hosted demo keeps itself alive with a daily cron.** Supabase pauses a free-tier project
@@ -483,9 +559,20 @@ Every simplification is listed with what production would change in
 
 ## Where this would go next
 
-1. **A real UPI Reserve Pay integration.** The simulated one is built (see above); the real
-   thing needs closed-beta access. That swap is the last genuine gap between this and
-   something a publisher could run.
+The work is planned in phases in [docs/implementation-plan.md](docs/implementation-plan.md).
+Phases 1–4 are done — correct domain model, authenticated operators and consent, reserved
+authority, and the double-entry journal. **Phases 5–9 are not started**, and the largest of
+them is the one that matters most:
+
+1. **Collection failure, refunds, and reconciliation (Phase 5).** The journal and the
+   allocation arithmetic exist and are property-tested; what does not exist yet is the
+   reconciler that compares our records against Razorpay's and classifies the differences —
+   missing webhook, charge without a batch, amount mismatch, stale pending batch. Deferred
+   collection makes failure a routine path rather than an edge case, so this is not optional
+   polish; it is the half of the product that handles the day things go wrong.
+2. **A real UPI Reserve Pay integration.** The simulated one is built; the real thing needs
+   access Razorpay gates behind a support request. That swap is the last genuine gap between
+   this and something a publisher could run.
 2. **Expose the facilitator over MCP** — done for the *agent* side (`agent-kit/mcp_server.py`);
    the publisher's own `/economics` and `/settle-batch` would be the operator-facing half.
 3. **Real x402 interop** — advertise both `razorpay-inr` and USDC-on-Base in `accepts[]` and let

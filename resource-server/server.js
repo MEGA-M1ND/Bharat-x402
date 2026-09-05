@@ -84,9 +84,9 @@ const PAY_TO = process.env.PAY_TO || "acc_BharatNewsNetwork";
 const PRICE = process.env.RESOURCE_PRICE || "₹5.00";
 
 // A second, sub-rupee resource. This is the price point that makes the whole
-// project's argument: ₹5 clears Razorpay's ₹1 minimum on its own, so without
-// this route the console's economics card would always show a zero — nothing
-// would ever be "uncollectable per-request" to point at.
+// project's argument: ₹5 clears the Razorpay Payment Links ₹1 minimum on its
+// own, so without this route the console's economics card would always show a
+// zero — nothing would ever be "uncollectable per-request" to point at.
 const PRICE_MICRO = process.env.RESOURCE_PRICE_MICRO || "₹0.50";
 
 const app = express();
@@ -136,7 +136,7 @@ app.use((req, res, next) => {
  * Header compatibility shim.
  *
  * The x402 payment proof header has two names in the wild. `X-PAYMENT` is the
- * original, and it is what most write-ups (and Cloudflare's own docs) describe.
+ * original, and it is what most write-ups describe.
  * @x402/core 2.x renamed it to `PAYMENT-SIGNATURE`.
  *
  * The library is not internally consistent about this: its *client* still sends

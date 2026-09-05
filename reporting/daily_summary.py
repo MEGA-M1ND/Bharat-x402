@@ -1,8 +1,14 @@
 """Bharat x402 — the publisher's daily revenue digest.
 
 Reads the facilitator's ledger and renders the message a publisher would
-actually receive: how many AI agents fetched their content today, what it
-earned, and which Razorpay Payment Links were created to collect it.
+actually receive: how many AI agents fetched their content today, what they
+accrued, how much of it has actually been collected, and which Razorpay Payment
+Links were created to collect the rest.
+
+Accrued and collected are reported as two separate lines, never merged into one
+figure labelled "earned". Under deferred settlement those numbers differ for
+most of the day, and the gap between them is the publisher's credit exposure —
+the single most important thing this report has to say.
 
 Formatted as a WhatsApp message on purpose. A regional publisher is not going
 to log into a dashboard to check whether crawlers paid them — they will read a
@@ -122,7 +128,7 @@ def render_whatsapp(
 
     lines: list[str] = []
     lines.append(f"*{publisher}*")
-    lines.append(f"Daily agent revenue · {date_label}")
+    lines.append(f"Daily agent usage · {date_label}")
     lines.append("")
 
     if requests == 0:
@@ -131,8 +137,17 @@ def render_whatsapp(
         lines.append("_Nothing to settle._")
         return "\n".join(lines)
 
-    lines.append(f"{icon('💰')}*{format_paise(total)}* earned from AI crawlers")
-    lines.append(f"{icon('📊')}{requests} paid requests · {len(agents)} agents")
+    # "Accrued", not "earned". `total` is the sum of commitments — what agents
+    # have signed up to owe. The money is reported one line down, separately,
+    # because a digest that prints one number under the word "earned" is a
+    # digest that overstates revenue every single day until collection lands.
+    collected_paise = summary.get("collectedPaise", 0)
+    lines.append(f"{icon('💰')}*{format_paise(total)}* accrued from AI crawlers")
+    lines.append(f"{icon('🏦')}*{format_paise(collected_paise)}* collected (gateway-confirmed)")
+    outstanding = max(total - collected_paise, 0)
+    if outstanding:
+        lines.append(f"{icon('⏳')}{format_paise(outstanding)} outstanding")
+    lines.append(f"{icon('📊')}{requests} authorized requests · {len(agents)} agents")
     if summary["rejectedPayments"]:
         lines.append(
             f"{icon('🛡')}{summary['rejectedPayments']} payment"
@@ -159,10 +174,13 @@ def render_whatsapp(
 
     lines.append("*Settlement*")
     if created:
-        collected = sum(b["total_paise"] for b in created)
+        # `created` means an invoice exists. Naming this sum `collected` — as
+        # this line used to — asserted that money arrived because we managed to
+        # ask for it. It is *billed*.
+        billed = sum(b["total_paise"] for b in created)
         lines.append(
             f"{icon('✅')}{len(created)} Payment Link"
-            f"{'s' if len(created) != 1 else ''} · {format_paise(collected)}"
+            f"{'s' if len(created) != 1 else ''} billed · {format_paise(billed)}"
         )
         lines.append("```")
         for batch in created[:5]:
@@ -195,7 +213,7 @@ def render_whatsapp(
     charges = len(created) or 1
     lines.append("*Why batching*")
     lines.append(
-        f"{icon('⚡')}{requests} agent requests collected in {charges} "
+        f"{icon('⚡')}{requests} agent requests billed in {charges} "
         f"gateway charge{'s' if charges != 1 else ''}."
     )
 
@@ -204,12 +222,13 @@ def render_whatsapp(
         lines.append(
             f"{icon('🚧')}{format_paise(micro['totalPaise'])} of this could not have "
             f"been collected at all per-request — {micro['count']} charges sit under "
-            f"Razorpay's {format_paise(model.minimum_charge_paise)} minimum."
+            f"the Razorpay Payment Links {format_paise(model.minimum_charge_paise)} "
+            "minimum."
         )
     else:
         lines.append(
             f"_Every charge here clears the {format_paise(model.minimum_charge_paise)} "
-            "gateway minimum, so batching saves API calls and reconciliation rather "
+            "Payment Links minimum, so batching saves API calls and reconciliation rather "
             "than fees. Below that floor it is the difference between getting paid "
             "and not._"
         )

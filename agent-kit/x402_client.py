@@ -199,6 +199,19 @@ class X402Client:
                 f"{self.agent_id} is registered with a different public key. Delete "
                 f"{KEY_DIR / f'{self.agent_id}.key'} or choose a different agent id."
             )
+        if response.status_code == 403:
+            # The facilitator is running its production-like profile, where
+            # binding a key by arriving first is disabled. Say what to do about
+            # it rather than surfacing a bare 403 — this is the single most
+            # likely error a new integrator hits, and "tofu_disabled" alone
+            # explains nothing.
+            raise PaymentRefused(
+                "This facilitator does not accept unauthenticated key registration. "
+                "An operator must enrol this agent: POST /control/agents/challenge "
+                "then POST /control/agents/enroll with an operator API key, signing "
+                "the returned nonce with this agent's private key. (A demo "
+                "deployment can set DEMO_UNSAFE_TOFU=true instead.)"
+            )
         if response.status_code != 200:
             raise PaymentRefused(f"key registration failed: {response.text[:300]}")
 

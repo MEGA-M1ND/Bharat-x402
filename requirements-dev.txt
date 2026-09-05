@@ -2,3 +2,10 @@
 # only facilitator/requirements.txt and demo-agent/requirements.txt.
 pytest==9.1.1
 ruff==0.14.5
+
+# Property-based testing for the accounting invariants. The journal's rules —
+# debits equal credits, a refund allocation sums exactly to the refund, a
+# replayed command posts nothing — are true for ALL inputs, not just the ones
+# someone thought to write down, and that is exactly the shape hypothesis is
+# for. See tests/test_journal.py.
+hypothesis==6.140.3

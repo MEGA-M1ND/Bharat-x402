@@ -582,6 +582,18 @@ code,
   gap: 10px;
 }
 
+/* Four money/count tiles. Drops to 2x2 rather than shrinking the numbers to
+   illegibility on a narrow panel. */
+.stat-row--four {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+@media (max-width: 900px) {
+  .stat-row--four {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
 .stat-tile {
   background: #fafafb;
   border: 1px solid var(--border);
@@ -601,6 +613,17 @@ code,
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 2px;
+}
+
+/* The clarification that stops a one-word label being read as the other
+   number: "accrued / owed, not yet collected". Deliberately small — it is a
+   footnote, not a heading. Pinned again in the dark block below, because the
+   tile keeps a light background in both themes. */
+.stat-tile__hint {
+  font-size: 10px;
+  line-height: 1.25;
+  color: var(--text-muted);
+  margin-top: 3px;
 }
 
 /* -------------------------------------------------------------------- card */
@@ -637,6 +660,80 @@ code,
 .card--economics {
   background: var(--accent-soft);
   border-color: #c7d2fe;
+}
+
+/* --------------------------------------------------- security profile card */
+
+/* Amber, not red. This deployment is deliberately configured this way and is
+   working correctly; the card is disclosure, not an error. Red would train a
+   reader to ignore it.
+
+   The background is PINNED — the same amber in light and dark — because the
+   card's job is to stand out from everything around it, and a token that
+   flips with the theme would lose that in dark mode. Which means every piece
+   of text on it has to be pinned too: `.card__head h3` inherits var(--text)
+   and `.card__sub` inherits var(--text-muted), and both go light in dark
+   mode, rendering near-white on near-white. That is not hypothetical — the
+   first screenshot of this card had an invisible heading, which is how it was
+   caught. This project has now hit the light-card/dark-token trap four times;
+   the rule is that pinning a background obliges you to pin its foreground. */
+.card--profile {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.card--profile .card__head h3 {
+  color: #78350f;
+}
+
+.card--profile .card__sub {
+  color: #92400e;
+}
+
+.profile__warn {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  color: #92400e;
+}
+
+.profile__ok {
+  margin: 0;
+  font-size: 12.5px;
+  color: #065f46;
+}
+
+.profile__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.profile__item {
+  display: grid;
+  gap: 1px;
+  padding: 7px 9px;
+  background: #fff;
+  border: 1px solid #fde68a;
+  border-radius: var(--radius-sm);
+}
+
+.profile__flag {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10.5px;
+  color: #92400e;
+  letter-spacing: 0.01em;
+}
+
+.profile__open {
+  font-size: 12px;
+  color: #101828;
+}
+
+.profile__closed {
+  font-size: 11px;
+  color: #667085;
 }
 
 /* ------------------------------------------------------------------ table */
@@ -924,5 +1021,12 @@ code,
 
   .stat-tile__label {
     color: #667085;
+  }
+
+  /* Same reason as .stat-tile__label above: the tile keeps a light background
+     in dark mode, so a var(--muted) hint on it would be near-white on
+     near-white. Pinned, not inherited. */
+  .stat-tile__hint {
+    color: #98a2b3;
   }
 }

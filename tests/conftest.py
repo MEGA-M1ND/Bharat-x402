@@ -80,10 +80,123 @@ def _reset_postgres_ledger(dsn: str) -> None:
         # leaving either populated between tests makes a second run of the
         # same test fail on a conflict that has nothing to do with the code
         # under test. The SQLite path gets this free by using a fresh file.
+        # Every table, including the Phase 2 identity and consent ones. A
+        # missing name here does not fail loudly — it leaks rows into the next
+        # test, which shows up much later as an order-dependent failure on
+        # Postgres only. `operators` and `merchants` are especially easy to
+        # forget and especially annoying: a leftover operator makes a
+        # "create then read back" test pass for the wrong reason.
         conn.execute(
-            "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events"
+            "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events,"
+            " operators, merchants, api_credentials, agent_credentials,"
+            " enrollment_challenges, spending_consents, consent_publishers,"
+            " authority_accounts, reservations,"
+            " journal_transactions, journal_entries"
             " RESTART IDENTITY CASCADE"
         )
+        # `accounts` is deliberately NOT truncated. It is reference data — the
+        # chart of accounts — not test state, and `journal_entries` has a
+        # foreign key to it. Emptying it between tests would make the first
+        # journal posting of the next test fail on a missing account, which
+        # would look like a bug in the journal rather than in this fixture.
+        #
+        # Seeded explicitly here rather than relying on Ledger.__init__,
+        # because on Postgres that only runs under LEDGER_AUTO_MIGRATE and a
+        # test that constructs a Ledger without it would otherwise find no
+        # accounts at all.
+        from ledger import Ledger
+
+        Ledger(dsn).seed_accounts()
+
+
+# The five switches whose *production* default is closed, and which the bulk
+# of this suite predates.
+#
+# Phase 2 changed each of these defaults from permissive to secure:
+#
+#   DEMO_OPEN_DASHBOARD   /ledger/summary, /economics and /ledger/events used
+#                         to answer anyone. They now require an API key.
+#   ALLOW_HMAC_FALLBACK   an unregistered agent could pay with a shared-secret
+#                         MAC. Registration is now required.
+#   DEMO_UNSAFE_TOFU      anyone could bind a key to an unclaimed agent id by
+#                         being first. Enrollment now needs an authenticated
+#                         operator and proof of possession.
+#   REQUIRE_CONSENT       an agent could spend with no operator behind it.
+#                         A consent is now required to incur any expense.
+#   AUTHORITY_REQUIRED    content was released against a promise. An amount
+#                         must now be reserved against a real authority
+#                         balance before the handler runs.
+#
+# The existing tests exercise the *payment flow* — negotiation, double-spend,
+# batching, webhooks — and are not about authorization. Rewriting all of them
+# to carry bearer tokens would obscure what each is actually asserting without
+# testing anything new, so they run under the legacy profile.
+#
+# The secure defaults are not therefore untested: `tests/test_control_plane.py`
+# builds the facilitator with this fixture disabled and asserts, endpoint by
+# endpoint, that each one refuses an unauthenticated caller and refuses a
+# caller from the wrong tenant. Opting *out* of the demo profile is how a test
+# declares it is about authorization.
+LEGACY_DEMO_PROFILE = {
+    "DEMO_OPEN_DASHBOARD": "true",
+    "ALLOW_HMAC_FALLBACK": "true",
+    "DEMO_UNSAFE_TOFU": "true",
+    # An agent with no operator consent may still spend. With it on, /offer
+    # and /settle refuse any agent that no operator has authorised.
+    "REQUIRE_CONSENT": "false",
+    # Content may be released without an amount being held against an
+    # authority balance first. The last switch, and the one that separates
+    # "you are allowed to" from "something stands behind it".
+    "AUTHORITY_REQUIRED": "false",
+}
+
+
+# The same five switches at their PRODUCTION values.
+#
+# Set explicitly rather than deleted, and that distinction is load-bearing.
+# `main.py` calls `load_dotenv(SERVICE_DIR / ".env")` on import, and dotenv
+# does not override variables already present in the environment — but it
+# happily supplies ones that are ABSENT. So deleting these left the .env file
+# free to put the demo values straight back, and every `secure_defaults` test
+# silently asserted against a permissive facilitator.
+#
+# That is exactly what happened: locally the developer's `.env` predated these
+# flags and contained none of them, so deleting genuinely unset them and the
+# tests passed. CI copies the *current* `.env.example`, which sets all five for
+# the demo — so the security tests turned into no-ops there and nowhere else.
+# A security test that passes for the wrong reason is worse than one that fails.
+SECURE_PROFILE = {
+    "DEMO_OPEN_DASHBOARD": "false",
+    "ALLOW_HMAC_FALLBACK": "false",
+    "DEMO_UNSAFE_TOFU": "false",
+    "REQUIRE_CONSENT": "true",
+    "AUTHORITY_REQUIRED": "true",
+}
+
+
+@pytest.fixture(autouse=True)
+def legacy_demo_profile(request, monkeypatch):
+    """Runs the pre-Phase-2 permissive profile, unless a test opts out.
+
+    Mark a test or class with `@pytest.mark.secure_defaults` to get the
+    production configuration instead — closed dashboard, no HMAC fallback, no
+    trust-on-first-use, and both consent and reserved authority required.
+    """
+    profile = (
+        SECURE_PROFILE
+        if request.node.get_closest_marker("secure_defaults")
+        else LEGACY_DEMO_PROFILE
+    )
+    for name, value in profile.items():
+        monkeypatch.setenv(name, value)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "secure_defaults: run with the production-like closed configuration "
+        "rather than the permissive demo profile",
+    )
 
 
 @pytest.fixture

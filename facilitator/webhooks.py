@@ -70,6 +70,7 @@ import json
 import os
 from typing import Any
 
+import journal
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -274,6 +275,28 @@ def _apply_paid(
             note="No unpaid batch matches this link. Acknowledged, nothing changed.",
         )
         return JSONResponse(status_code=200, content={"status": "no_matching_batch"})
+
+    # The journal posting for the only event in this system that turns a
+    # receivable into value we hold.
+    #
+    # `command_ref` keys off the BATCH, not the webhook delivery: Razorpay
+    # retries with backoff for 24 hours and duplicates are routine, so a
+    # per-delivery key would post a second set of entries for the same money.
+    # The webhook_events primary key already makes processing exactly-once;
+    # this is the same guarantee at the accounting layer, so the journal is
+    # correct even if the two ever disagree.
+    #
+    # Posted with the amount Razorpay reported, not the amount we billed. If
+    # they differ that is a discrepancy for reconciliation to classify, and
+    # writing down what we expected instead of what arrived would hide it.
+    ledger.post_journal(
+        journal.confirm_collection(
+            command_ref=f"collect:{batch['batch_id']}",
+            amount_paise=amount_paid,
+            agent_id=batch["agent_id"],
+            batch_id=batch["batch_id"],
+        )
+    )
 
     ledger.finish_webhook(
         dedupe_key=dedupe_key,

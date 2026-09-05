@@ -23,7 +23,7 @@ WHY THE SHAPE MATTERS MORE THAN THE FEES
 Pay does not remove all of them, and it is worth being precise about which,
 because the tempting overclaim is "Reserve Pay fixes everything":
 
-  1. **The ₹1.00 gateway minimum — NOT fixed.** A debit is still a payment
+  1. **The ₹1.00 Payment Links minimum — NOT fixed.** A debit is still a payment
      instruction on the UPI rail, and nothing about a block makes a 50-paise
      debit economic. Batching is still what makes sub-rupee pricing exist.
   2. **Checkout has a human in it — FIXED, and this is the point.** A Payment

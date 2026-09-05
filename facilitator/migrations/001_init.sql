@@ -22,17 +22,255 @@
 --     > facilitator/migrations/001_init.sql
 --   (then restore this header comment above the generated SQL)
 
+-- ======================================================================
+-- IDENTITY AND CONSENT
+-- ======================================================================
+-- Declared first because `agents`, `api_credentials`, and `spending_consents`
+-- all reference them. Postgres resolves foreign keys at CREATE TABLE time and
+-- errors if the referenced table does not exist yet; SQLite resolves lazily
+-- and would not have caught the ordering. Same trap as `batches` before
+-- `commitments`.
+
+-- The party that answers for an agent's spending. An agent is a *process*;
+-- an operator is who you would invoice, suspend, or argue with.
+--
+-- This is the entity the original design was missing entirely. Without it a
+-- pseudonymous key promised to pay and content was released on that promise,
+-- with nothing standing behind it. See docs/adr/0001.
+CREATE TABLE IF NOT EXISTS operators (
+    operator_id  TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    -- active | suspended | closed
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL
+);
+
+-- The publisher being paid. Consents are scoped to these, so an operator can
+-- authorise spend at one publisher without authorising it everywhere.
+CREATE TABLE IF NOT EXISTS merchants (
+    merchant_id                  TEXT PRIMARY KEY,
+    display_name                 TEXT NOT NULL,
+    -- Where collected value would eventually be paid out. Opaque here: this
+    -- project never performs a payout.
+    settlement_account_reference TEXT,
+    status                       TEXT NOT NULL DEFAULT 'active',
+    created_at                   TEXT NOT NULL
+);
+
+-- Control-plane API keys.
+--
+-- Only the HASH is stored. The plaintext is returned once, at issuance, and
+-- is unrecoverable afterwards — so a disclosure of this table yields nothing
+-- an attacker can authenticate with. `key_prefix` is a non-secret fragment
+-- kept so a human can tell two keys apart in a listing without the listing
+-- being a credential dump.
+CREATE TABLE IF NOT EXISTS api_credentials (
+    credential_id TEXT PRIMARY KEY,
+    -- Exactly one of these is set: the tenant this key speaks for. Enforced
+    -- in `create_api_credential` rather than by a CHECK, because the check
+    -- would have to differ per dialect.
+    operator_id   TEXT,
+    merchant_id   TEXT,
+    label         TEXT NOT NULL,
+    key_prefix    TEXT NOT NULL,
+    key_hash      TEXT NOT NULL UNIQUE,
+    -- Space-separated scope tokens. A string rather than a join table: scopes
+    -- are read on every authenticated request and never queried across rows.
+    scopes        TEXT NOT NULL,
+    -- active | revoked
+    status        TEXT NOT NULL DEFAULT 'active',
+    created_at    TEXT NOT NULL,
+    last_used_at  TEXT,
+    revoked_at    TEXT,
+    -- Set on rotation, so an audit can follow a key's lineage.
+    replaced_by   TEXT,
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
+);
 
 -- One row per agent that has registered a signing key. Holds only the
 -- *public* half: the facilitator can verify an agent's commitments and can
 -- never produce one, which is the entire point of moving off a shared HMAC
 -- secret (see payment_verifier.py).
+--
+-- `public_key`/`algorithm` are retained as the *currently active* key. They
+-- are a denormalisation of `agent_credentials`, kept because every existing
+-- verification path reads them and because the join is on the hot path of
+-- every paid request. `agent_credentials` is authoritative for validity.
 CREATE TABLE IF NOT EXISTS agents (
     agent_id      TEXT PRIMARY KEY,
     -- base64 of the raw 32-byte Ed25519 public key.
     public_key    TEXT NOT NULL,
     algorithm     TEXT NOT NULL,
-    registered_at TEXT NOT NULL
+    registered_at TEXT NOT NULL,
+    -- Null for agents enrolled under trust-on-first-use, which is exactly the
+    -- gap this column exists to make visible.
+    operator_id   TEXT,
+    -- active | suspended | closed
+    status        TEXT NOT NULL DEFAULT 'active',
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- The signing-key lifecycle: enrollment, rotation, revocation, expiry.
+--
+-- Credentials are ROWS, not a column that gets overwritten, and that is the
+-- whole design. Revocation must stop *new* authorization without invalidating
+-- *past* evidence — an acceptance signed last week has to stay verifiable
+-- against the key that signed it, or rotating a key would silently destroy
+-- the audit trail that makes Ed25519 worth using at all.
+CREATE TABLE IF NOT EXISTS agent_credentials (
+    credential_id TEXT PRIMARY KEY,
+    agent_id      TEXT NOT NULL,
+    algorithm     TEXT NOT NULL,
+    public_key    TEXT NOT NULL,
+    -- active | superseded | revoked
+    status        TEXT NOT NULL DEFAULT 'active',
+    valid_from    TEXT NOT NULL,
+    -- Null means no expiry.
+    valid_until   TEXT,
+    revoked_at    TEXT,
+    replaced_by   TEXT,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+);
+
+-- Proof-of-possession challenges for authenticated key enrollment.
+--
+-- Replaces "the first caller to claim an id owns it". An operator asks for a
+-- challenge, the agent signs the nonce with the private key it claims to
+-- hold, and only a valid signature binds the public key. Single-use and
+-- time-limited, for the same reason offers are.
+CREATE TABLE IF NOT EXISTS enrollment_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    operator_id  TEXT NOT NULL,
+    agent_id     TEXT NOT NULL,
+    nonce        TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    consumed_at  TEXT,
+    created_at   TEXT NOT NULL,
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- An operator's standing authorisation for one agent to spend, with limits.
+--
+-- Modelled on the consent shape Razorpay and NPCI describe for UPI Reserve
+-- Pay: a one-time authorisation carrying spending limits, revocable at any
+-- time, under which an agent transacts without re-prompting. Every limit is
+-- integer paise.
+--
+-- `reserved_paise` and `consumed_paise` are the live counters. They move
+-- inside conditional UPDATEs (see authority.py), never read-then-write, so
+-- concurrent requests cannot jointly exceed one limit.
+CREATE TABLE IF NOT EXISTS spending_consents (
+    consent_id              TEXT PRIMARY KEY,
+    operator_id             TEXT NOT NULL,
+    agent_id                TEXT NOT NULL,
+    -- active | suspended | revoked | expired
+    status                  TEXT NOT NULL DEFAULT 'active',
+    currency                TEXT NOT NULL DEFAULT 'INR',
+    per_request_limit_paise INTEGER NOT NULL,
+    daily_limit_paise       INTEGER NOT NULL,
+    total_limit_paise       INTEGER NOT NULL,
+    reserved_paise          INTEGER NOT NULL DEFAULT 0,
+    consumed_paise          INTEGER NOT NULL DEFAULT 0,
+    valid_from              TEXT NOT NULL,
+    valid_until             TEXT,
+    created_at              TEXT NOT NULL,
+    revoked_at              TEXT,
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id),
+    FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+);
+
+-- Publisher scope for a consent. No rows means "any publisher"; one or more
+-- restricts the consent to exactly those merchants.
+--
+-- A join table rather than a list column because "which consents may spend at
+-- this merchant?" is a real query, and because a scope that is wrong is a
+-- scope that authorises spending somewhere it should not.
+CREATE TABLE IF NOT EXISTS consent_publishers (
+    consent_id  TEXT NOT NULL,
+    merchant_id TEXT NOT NULL,
+    PRIMARY KEY (consent_id, merchant_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
+);
+
+-- ======================================================================
+-- AUTHORITY: what actually stands behind a request
+-- ======================================================================
+
+-- The balance a consent draws against.
+--
+-- WHAT THIS IS NOT: money. Nothing here is held at a bank, and no NPCI
+-- mandate exists. `simulated_reserve` models the *domain* behaviour of UPI
+-- Reserve Pay — an amount blocked up front and debited repeatedly — because
+-- the accounting and concurrency questions are real even when the block is
+-- not. See docs/gap-analysis.md, which says so in the same words.
+--
+-- Every column is integer paise, and they are related by an invariant the
+-- tests assert:
+--
+--     funded = available + reserved + captured - refunded
+--
+-- `available` is what a new request may draw on. `reserved` is held for
+-- requests in flight. `captured` has been converted into a receivable and is
+-- gone from this account's spendable balance for good.
+CREATE TABLE IF NOT EXISTS authority_accounts (
+    account_id      TEXT PRIMARY KEY,
+    consent_id      TEXT NOT NULL UNIQUE,
+    operator_id     TEXT NOT NULL,
+    -- prefunded        a balance topped up in advance. No credit risk.
+    -- simulated_reserve a modelled Reserve Pay block. Explicitly simulated.
+    -- credit           no funds at all; a limit the platform is exposed to.
+    backing         TEXT NOT NULL,
+    currency        TEXT NOT NULL DEFAULT 'INR',
+    funded_paise    INTEGER NOT NULL DEFAULT 0,
+    available_paise INTEGER NOT NULL DEFAULT 0,
+    reserved_paise  INTEGER NOT NULL DEFAULT 0,
+    captured_paise  INTEGER NOT NULL DEFAULT 0,
+    refunded_paise  INTEGER NOT NULL DEFAULT 0,
+    -- Credit only: how far the platform will let exposure run. Zero for the
+    -- funded backings, where `available_paise` is the whole story.
+    credit_limit_paise INTEGER NOT NULL DEFAULT 0,
+    -- Collection failures that have not been recovered. Past a threshold this
+    -- suspends further authorization — see limits.py.
+    overdue_paise   INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id),
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- An amount held against an account while a request is in flight.
+--
+-- The lifecycle that makes "content is released against authority" true
+-- rather than aspirational:
+--
+--   held      -> reserved before the handler runs
+--   captured  -> fulfillment succeeded; converted to a receivable, once
+--   released  -> fulfillment failed; the authority goes back
+--   expired   -> neither happened before the TTL; swept back
+--
+-- `offer_id` is UNIQUE. That is the exactly-once guarantee for capture,
+-- enforced by the database rather than by application logic remembering to
+-- check — the same discipline as `commitments.offer_id`. A retried request
+-- finds the existing reservation instead of holding a second amount.
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    consent_id     TEXT NOT NULL,
+    agent_id       TEXT NOT NULL,
+    offer_id       TEXT NOT NULL UNIQUE,
+    amount_paise   INTEGER NOT NULL,
+    -- held | captured | released | expired
+    status         TEXT NOT NULL DEFAULT 'held',
+    created_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    resolved_at    TEXT,
+    commitment_id  TEXT,
+    FOREIGN KEY (account_id) REFERENCES authority_accounts (account_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
 );
 
 CREATE TABLE IF NOT EXISTS offers (
@@ -98,10 +336,97 @@ CREATE TABLE IF NOT EXISTS commitments (
     -- deferred: awaiting batch. per_request: charged immediately.
     mode          TEXT NOT NULL,
     -- pending | settled | failed
+    --
+    -- Note on the word: `settled` here has always meant "assigned to a
+    -- batch", never "money arrived". It is retained because reporting and a
+    -- number of tests read it, and renaming a stored value is a data
+    -- migration rather than a rename. `collected` is the word reserved for
+    -- gateway-confirmed money, and lives on `batches.status`.
     status        TEXT NOT NULL DEFAULT 'pending',
     batch_id      TEXT,
+    -- Who answers for this debt, and under what authorisation.
+    --
+    -- Null on commitments booked before operators existed, and on any booked
+    -- through the unsafe demo path. A null here means "nobody is on the hook
+    -- for this but a pseudonymous key", which is precisely the state worth
+    -- being able to query for.
+    operator_id   TEXT,
+    consent_id    TEXT,
     FOREIGN KEY (offer_id) REFERENCES offers (offer_id),
-    FOREIGN KEY (batch_id) REFERENCES batches (batch_id)
+    FOREIGN KEY (batch_id) REFERENCES batches (batch_id),
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
+);
+
+-- ======================================================================
+-- DOUBLE-ENTRY JOURNAL
+-- ======================================================================
+-- The status columns above answer "where is this commitment?". They cannot
+-- answer "what happened to the money, in what order, and does it add up?" —
+-- and a refund allocated across an aggregate collection, or a write-off that
+-- has to leave a trail, needs the second question answered.
+--
+-- Two rules make this a journal rather than a log:
+--
+--   1. Every money-changing operation posts a transaction whose debits equal
+--      its credits. Enforced in `post_journal` before commit.
+--   2. Nothing is ever updated or deleted. An error is corrected by posting a
+--      COMPENSATING transaction that references the original, so the books
+--      show both what was believed and what turned out to be true.
+--
+-- See docs/adr/0004-integer-paise-and-accounting-invariants.md.
+
+-- The chart of accounts. Seeded by `_seed_accounts`, not by a migration, so
+-- there is one definition of what an account means.
+CREATE TABLE IF NOT EXISTS accounts (
+    account_code   TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    -- asset | liability | equity | revenue | expense
+    account_type   TEXT NOT NULL,
+    -- debit | credit. Which direction increases this account, so a report can
+    -- present a balance with the right sign without hardcoding a list.
+    normal_balance TEXT NOT NULL
+);
+
+-- One economic event. Immutable once posted.
+CREATE TABLE IF NOT EXISTS journal_transactions (
+    txn_id       TEXT PRIMARY KEY,
+    -- The idempotency key, and the reason a retry after an unknown gateway
+    -- outcome is safe: a replayed command finds this row and posts nothing.
+    -- UNIQUE is what enforces it, not application logic remembering to check.
+    command_ref  TEXT NOT NULL UNIQUE,
+    txn_type     TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,
+    posted_at    TEXT NOT NULL,
+    description  TEXT,
+    -- Set on a compensating transaction, naming the one it reverses. The
+    -- original stays exactly as posted.
+    reverses_txn_id TEXT,
+    FOREIGN KEY (reverses_txn_id) REFERENCES journal_transactions (txn_id)
+);
+
+-- The legs. Debits and credits of one transaction must sum equal.
+--
+-- `amount_paise` is always POSITIVE; `direction` carries the sign. Signed
+-- amounts plus a direction column would let the same fact be represented two
+-- ways, and a balance check would then have to guess which convention a row
+-- was written under.
+CREATE TABLE IF NOT EXISTS journal_entries (
+    entry_id      TEXT PRIMARY KEY,
+    txn_id        TEXT NOT NULL,
+    account_code  TEXT NOT NULL,
+    -- debit | credit
+    direction     TEXT NOT NULL,
+    amount_paise  INTEGER NOT NULL,
+    -- Dimensions, so a balance can be sliced without joining back through
+    -- three tables. Nullable: not every posting has every dimension.
+    agent_id      TEXT,
+    operator_id   TEXT,
+    merchant_id   TEXT,
+    commitment_id TEXT,
+    batch_id      TEXT,
+    FOREIGN KEY (txn_id) REFERENCES journal_transactions (txn_id),
+    FOREIGN KEY (account_code) REFERENCES accounts (account_code)
 );
 
 -- Append-only. Nothing in this table is ever updated or deleted; it is the
@@ -117,8 +442,9 @@ CREATE TABLE IF NOT EXISTS events (
     detail       TEXT
 );
 
--- Razorpay retries a webhook until it gets a 2xx, so the same event will
--- arrive more than once as a matter of course — not as an edge case. The
+-- Razorpay retries a failed delivery with exponential backoff for 24 hours
+-- (after which the webhook is disabled), so the same event will arrive more
+-- than once as a matter of course — not as an edge case. The
 -- primary key is the dedupe guard: processing claims the key with an INSERT
 -- first, and a duplicate delivery loses that INSERT and returns early
 -- without touching a batch. Same discipline as `commitments.offer_id`:
@@ -139,3 +465,21 @@ CREATE INDEX IF NOT EXISTS idx_commitments_settlement
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS idx_batches_payment_link ON batches (payment_link_id);
 
+-- The authentication hot path: every control-plane request hashes its bearer
+-- token and looks it up here.
+CREATE INDEX IF NOT EXISTS idx_api_credentials_hash ON api_credentials (key_hash);
+-- "Which key is currently active for this agent?" — read on every paid request.
+CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent
+    ON agent_credentials (agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_consents_agent ON spending_consents (agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_agents_operator ON agents (operator_id);
+-- Tenant-scoped reads: "everything this operator is on the hook for".
+CREATE INDEX IF NOT EXISTS idx_commitments_operator ON commitments (operator_id, settle_date);
+-- The sweeper's query: held reservations past their TTL.
+CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON reservations (status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_authority_operator ON authority_accounts (operator_id);
+-- Trial balance and per-account rollups.
+CREATE INDEX IF NOT EXISTS idx_journal_entries_account ON journal_entries (account_code);
+CREATE INDEX IF NOT EXISTS idx_journal_entries_txn ON journal_entries (txn_id);
+-- "Show me everything that happened to this receivable."
+CREATE INDEX IF NOT EXISTS idx_journal_entries_commitment ON journal_entries (commitment_id);
