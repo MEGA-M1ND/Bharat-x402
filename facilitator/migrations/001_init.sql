@@ -117,8 +117,9 @@ CREATE TABLE IF NOT EXISTS events (
     detail       TEXT
 );
 
--- Razorpay retries a webhook until it gets a 2xx, so the same event will
--- arrive more than once as a matter of course — not as an edge case. The
+-- Razorpay retries a failed delivery with exponential backoff for 24 hours
+-- (after which the webhook is disabled), so the same event will arrive more
+-- than once as a matter of course — not as an edge case. The
 -- primary key is the dedupe guard: processing claims the key with an INSERT
 -- first, and a duplicate delivery loses that INSERT and returns early
 -- without touching a batch. Same discipline as `commitments.offer_id`:

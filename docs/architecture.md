@@ -2,13 +2,22 @@
 
 ## The problem
 
-Cloudflare's x402 protocol lets an AI agent pay per request for gated content, using
+**x402** — authored by Coinbase, now developed through the x402 Foundation Coinbase and
+Cloudflare announced together — lets an AI agent pay per request for gated content, using
 HTTP 402 and a payment proof in a header. It works, and its reference implementation
 settles USDC on an EVM chain. For an Indian publisher that is the wrong currency, the
 wrong rail, and a compliance question they did not ask for — so the practical answer to
 "can Indian publishers monetise AI crawler traffic with x402?" has been *not without
 stablecoin infrastructure*. Meanwhile agent traffic to Indian sites keeps growing and
 none of it pays.
+
+Cloudflare's [Pay Per Crawl](https://developers.cloudflare.com/ai-crawl-control/features/pay-per-crawl/)
+is the clearest statement of the same problem from the publisher's side, and it is worth
+being precise about the relationship: Pay Per Crawl is **not** x402. It uses its own
+`crawler-price` / `crawler-max-price` / `crawler-charged` headers and identifies crawlers
+with Web Bot Auth. Cloudflare's x402-based product is the separate Monetization Gateway.
+Pay Per Crawl motivates this project; nothing here depends on Cloudflare at runtime. See
+[research-sources.md](research-sources.md).
 
 x402 is explicitly facilitator-agnostic: any service that can verify a payment payload
 and settle it can act as a facilitator. **Bharat x402 is that service, for rupees.** It

@@ -582,6 +582,18 @@ code,
   gap: 10px;
 }
 
+/* Four money/count tiles. Drops to 2x2 rather than shrinking the numbers to
+   illegibility on a narrow panel. */
+.stat-row--four {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+@media (max-width: 900px) {
+  .stat-row--four {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
 .stat-tile {
   background: #fafafb;
   border: 1px solid var(--border);
@@ -601,6 +613,17 @@ code,
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 2px;
+}
+
+/* The clarification that stops a one-word label being read as the other
+   number: "accrued / owed, not yet collected". Deliberately small — it is a
+   footnote, not a heading. Pinned again in the dark block below, because the
+   tile keeps a light background in both themes. */
+.stat-tile__hint {
+  font-size: 10px;
+  line-height: 1.25;
+  color: var(--text-muted);
+  margin-top: 3px;
 }
 
 /* -------------------------------------------------------------------- card */
@@ -924,5 +947,12 @@ code,
 
   .stat-tile__label {
     color: #667085;
+  }
+
+  /* Same reason as .stat-tile__label above: the tile keeps a light background
+     in dark mode, so a var(--muted) hint on it would be near-white on
+     near-white. Pinned, not inherited. */
+  .stat-tile__hint {
+    color: #98a2b3;
   }
 }

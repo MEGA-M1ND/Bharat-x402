@@ -214,8 +214,9 @@ class TestWebhookPayment:
         assert after["paidBatches"] == 1
 
     def test_redelivery_is_applied_exactly_once(self, hooked):
-        """Razorpay retries until it gets a 2xx, so this is the normal case,
-        not an edge case. Applying twice would double-count collected revenue.
+        """Razorpay retries a failed delivery with backoff for 24 hours, so
+        this is the normal case, not an edge case. Applying twice would
+        double-count collected revenue.
         """
         client, link_id, agent_id, ledger = hooked
         raw, headers = signed(paid_event(link_id, amount_paid=500))

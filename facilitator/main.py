@@ -94,6 +94,27 @@ X402_VERSION = 2
 #              show it failing on sub-₹1 amounts.
 SETTLEMENT_MODE = os.getenv("SETTLEMENT_MODE", "deferred")
 
+# Identifier for this facilitator's own x402 extension, advertised on
+# /supported and echoed in the /settle response.
+#
+# The x402 spec (v2 §7.3.1) treats `extensions` as a list of identifiers a
+# facilitator implements. Ours declares one thing: settlement is deferred, so
+# a successful /settle records a receivable and moves no money. Namespaced by
+# reverse-domain and versioned, so it cannot collide with a future standard
+# extension and a client can pin the shape it parses.
+#
+# See docs/protocol-extension.md.
+DEFERRED_EXTENSION_ID = "in.bharatx402.deferred-settlement/v1"
+
+# Whether a request must hold reserved authority before content is released.
+# Phase 3 makes this meaningful; declared here so /supported can advertise it
+# from the start rather than changing shape later.
+AUTHORITY_REQUIRED = os.getenv("AUTHORITY_REQUIRED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 HMAC_SECRET = os.getenv("FACILITATOR_HMAC_SECRET", "dev-only-shared-secret-change-me")
 
 # Whether an agent with no registered Ed25519 key may still pay with a
@@ -406,6 +427,21 @@ def supported() -> dict:
                     "decimals": 2,  # amounts travel as integer paise
                     "settlementRail": "razorpay",
                     "settlementMode": SETTLEMENT_MODE,
+                    # The single most important field here, and the reason
+                    # this scheme needs an extension at all.
+                    #
+                    # In the reference `exact` scheme, a successful /settle
+                    # has broadcast a transfer — funds moved. Here it has
+                    # booked a receivable and moved nothing. A client that
+                    # cannot tell those apart will report a debt to its user
+                    # as a completed payment.
+                    #
+                    # Expressed as a boolean rather than left to prose in a
+                    # README, so a client can branch on it. See
+                    # docs/protocol-extension.md.
+                    "fundsMoveAtSettle": False,
+                    "settlementTiming": "batched",
+                    "authorityRequired": AUTHORITY_REQUIRED,
                     # payment_link | reserve_pay. A client that cares whether
                     # settlement involves a page a human opens can see it here.
                     "settlementInstrument": gateway.instrument,
@@ -427,8 +463,14 @@ def supported() -> dict:
                 },
             }
         ],
-        # No x402 protocol extensions (bazaar, sign-in-with-x, ...) implemented.
-        "extensions": [],
+        # Spec v2 §7.3.1: "Array of extension identifiers the facilitator has
+        # implemented." None of the upstream extensions (bazaar,
+        # sign-in-with-x, ...) are implemented — this is our own, declaring
+        # that settlement here is deferred rather than immediate.
+        #
+        # Namespaced and versioned so it cannot collide with a future
+        # standard extension, and so a client can pin the shape it understands.
+        "extensions": [DEFERRED_EXTENSION_ID],
         # For EVM facilitators this maps network family to signer addresses.
         # Our equivalent is the merchant account rupees land in.
         "signers": {"razorpay:*": [FACILITATOR_ACCOUNT]},
@@ -637,6 +679,52 @@ def verify(request: X402Request) -> JSONResponse:
     )
 
 
+def _deferred_extension(
+    *,
+    commitment_id: str,
+    settle_date: str,
+    collected: bool = False,
+    replayed: bool = False,
+) -> dict:
+    """The lifecycle block echoed under `extensions` in a settle response.
+
+    Five booleans instead of one overloaded `success`, because "the request was
+    authorized", "the content was delivered", "a debt exists", and "money
+    arrived" are four different questions and a client that cannot tell them
+    apart will show a user a receivable labelled as a completed payment.
+
+    A conforming upstream client that ignores `extensions` still works — it
+    reads `success` and `transaction` as usual. That is the compatibility
+    guarantee. This block is for clients that want the truth.
+
+    Args:
+        commitment_id: The receivable this settlement recorded.
+        settle_date: The batching key the commitment was booked against.
+        collected: Whether a gateway confirmation has already landed. Almost
+            always False here: collection happens in a later batch run.
+        replayed: Whether this response returned a pre-existing commitment
+            rather than creating one.
+
+    Returns:
+        A dict suitable for `extensions[DEFERRED_EXTENSION_ID]`.
+    """
+    return {
+        DEFERRED_EXTENSION_ID: {
+            "authorized": True,
+            "fulfilled": True,
+            "committed": True,
+            # The publisher is owed money and has not received it. This is the
+            # field that distinguishes this scheme from `exact`.
+            "collectionPending": not collected,
+            "collected": collected,
+            "fundsMoved": collected,
+            "commitmentId": commitment_id,
+            "settleDate": settle_date,
+            "replayed": replayed,
+        }
+    }
+
+
 @app.post("/settle")
 def settle(request: X402Request) -> JSONResponse:
     """Make a verified payment final.
@@ -715,6 +803,11 @@ def settle(request: X402Request) -> JSONResponse:
                 "payer": existing["agent_id"],
                 "amount": str(existing["amount_paise"]),
                 "extra": {"replayed": True, "settlementMode": existing["mode"]},
+                "extensions": _deferred_extension(
+                    commitment_id=existing["commitment_id"],
+                    settle_date=existing["settle_date"],
+                    replayed=True,
+                ),
             },
         )
 
@@ -762,7 +855,13 @@ def settle(request: X402Request) -> JSONResponse:
                     "transaction": existing["commitment_id"],
                     "network": X402_NETWORK,
                     "payer": existing["agent_id"],
+                    "amount": str(existing["amount_paise"]),
                     "extra": {"replayed": True},
+                    "extensions": _deferred_extension(
+                        commitment_id=existing["commitment_id"],
+                        settle_date=existing["settle_date"],
+                        replayed=True,
+                    ),
                 },
             )
         return failure("offer_unavailable", str(exc), agent_id=result["agentId"])
@@ -798,6 +897,10 @@ def settle(request: X402Request) -> JSONResponse:
                 "humanAmount": format_paise(commitment["amountPaise"]),
                 "note": "Commitment recorded; rupees move in the next batched Payment Link.",
             },
+            "extensions": _deferred_extension(
+                commitment_id=commitment["commitmentId"],
+                settle_date=commitment["settleDate"],
+            ),
         },
     )
 

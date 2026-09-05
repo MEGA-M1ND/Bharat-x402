@@ -267,10 +267,12 @@ python reporting/daily_summary.py
 ```
 ┌────────────────────────────────────────────────────────┐
 │ *Bharat News Network*                                  │
-│ Daily agent revenue · 11 Aug 2026                      │
+│ Daily agent usage · 11 Aug 2026                        │
 │                                                        │
-│ 💰 *₹45.00* earned from AI crawlers                    │
-│ 📊 9 paid requests · 4 agents                          │
+│ 💰 *₹45.00* accrued from AI crawlers                   │
+│ 🏦 *₹0.00* collected (gateway-confirmed)               │
+│ ⏳ ₹45.00 outstanding                                  │
+│ 📊 9 authorized requests · 4 agents                    │
 │                                                        │
 │ *Top payers*                                           │
 │ 1. agent-claude-web — 5 req · ₹25.00                   │
@@ -278,14 +280,24 @@ python reporting/daily_summary.py
 │ ...                                                    │
 │                                                        │
 │ *Settlement*                                           │
-│ ✅ 4 Payment Links · ₹45.00                            │
+│ ✅ 4 Payment Links billed · ₹45.00                     │
 │ ```                                                    │
-│ plink_MOCK9b0d796684bd56     ₹10.00    2 req           │
+│ plink_MOCK9b0d796680bd56     ₹10.00    2 req           │
 │ ...                                                    │
 │ ```                                                    │
-│ 🔗 https://rzp.io/i/mock-6684bd56                      │
+│ 🔗 https://rzp.io/i/mock-6684bd50                      │
 └────────────────────────────────────────────────────────┘
 ```
+
+**Read the top three lines again.** ₹45.00 accrued, ₹0.00 collected, ₹45.00 outstanding —
+from the same run, at the same moment. That gap is the whole cost of deferred settlement:
+the content is gone and the money has not arrived. Four Payment Links exist, which means
+the publisher has *asked* for ₹45.00, not received it. Only a signature-verified webhook
+moves the collected line.
+
+An earlier version of this report printed one number labelled "earned", which was the
+accrued figure. It overstated revenue by the entire outstanding balance, every day, until
+collection happened to land.
 
 Formatted as a WhatsApp message on purpose — a regional publisher will not log into a
 dashboard to check whether crawlers paid them. `--json` gives the machine-readable form,

@@ -266,8 +266,9 @@ CREATE TABLE IF NOT EXISTS events (
     detail       TEXT
 );
 
--- Razorpay retries a webhook until it gets a 2xx, so the same event will
--- arrive more than once as a matter of course — not as an edge case. The
+-- Razorpay retries a failed delivery with exponential backoff for 24 hours
+-- (after which the webhook is disabled), so the same event will arrive more
+-- than once as a matter of course — not as an edge case. The
 -- primary key is the dedupe guard: processing claims the key with an INSERT
 -- first, and a duplicate delivery loses that INSERT and returns early
 -- without touching a batch. Same discipline as `commitments.offer_id`:
@@ -957,8 +958,9 @@ class Ledger:
     ) -> bool:
         """Claims a webhook delivery for processing, exactly once.
 
-        Razorpay retries until it gets a 2xx, so redelivery is routine rather
-        than exceptional — and a redelivered `payment_link.paid` that gets
+        Razorpay retries a failed delivery with exponential backoff for 24
+        hours, so redelivery is routine rather than exceptional — and a
+        redelivered `payment_link.paid` that gets
         applied twice would double-count collected revenue. The guard is a
         primary-key INSERT rather than a "have we seen this?" SELECT: two
         concurrent deliveries of the same event both pass a SELECT check, and

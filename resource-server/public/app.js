@@ -416,10 +416,14 @@ function renderResult(run) {
   const receiptExtra = (run.receipt && run.receipt.extra) || {};
 
   let html = `<p class="result__title">✓ Content unlocked</p>`;
+  // "Committed", not "Paid". At this point the agent has signed an acceptance
+  // and the facilitator has booked a receivable — no rupees have moved, and
+  // none will until a batch is collected and Razorpay confirms it.
   html +=
-    `<p class="result__meta">Paid ${paise(run.amountPaise)} · ` +
-    `${escapeHtml(receiptExtra.settlementMode || "settled")} · ` +
-    `<code>${escapeHtml((run.receipt && run.receipt.transaction) || "")}</code></p>`;
+    `<p class="result__meta">Committed ${paise(run.amountPaise)} · ` +
+    `${escapeHtml(receiptExtra.settlementMode || "deferred")} · ` +
+    `<code>${escapeHtml((run.receipt && run.receipt.transaction) || "")}</code></p>` +
+    `<p class="result__meta muted">Receivable recorded — not yet collected.</p>`;
 
   if (content.title) {
     html += `<p class="result__title" style="font-size:13px">${escapeHtml(content.title)}</p>`;
@@ -730,10 +734,28 @@ function renderChargeChart(econRes) {
   el.innerHTML = svg + caption;
 }
 
+// Accrued, collected, and the gap between them.
+//
+// `totalPaise` is what agents have *committed to owe*. Rendering it under the
+// word "earned" — which this dashboard used to do — reports money that has not
+// arrived and may never. `collectedPaise` counts only batches a signed Razorpay
+// webhook confirmed, and outstanding is the difference: the publisher's live
+// credit exposure, which is the honest cost of deferred settlement and belongs
+// on the dashboard rather than in a footnote.
 function renderStats(summary) {
-  document.getElementById("stat-revenue").textContent = paise(summary.totalPaise);
+  const accrued = summary.committedPaise ?? summary.totalPaise ?? 0;
+  const collected = summary.collectedPaise ?? 0;
+
+  document.getElementById("stat-accrued").textContent = paise(accrued);
+  document.getElementById("stat-collected").textContent = paise(collected);
+  // Clamped at zero: an over-collection would be a reconciliation defect, and
+  // a negative "outstanding" would read as the publisher owing the agent.
+  document.getElementById("stat-outstanding").textContent = paise(Math.max(accrued - collected, 0));
   document.getElementById("stat-requests").textContent = String(summary.requests);
-  document.getElementById("stat-agents").textContent = String((summary.byAgent || []).length);
+
+  const agents = (summary.byAgent || []).length;
+  document.getElementById("stat-agents").textContent = String(agents);
+  document.getElementById("stat-agents-plural").textContent = agents === 1 ? "" : "s";
 }
 
 function renderTopPayers(rows) {

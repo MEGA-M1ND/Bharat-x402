@@ -303,7 +303,8 @@ class TestLedger:
         """Mixed traffic: the figure must come from rows, not from averages.
 
         This is the bug that shipped once. One ₹5 fetch plus four ₹0.50 calls
-        has a mean above the ₹1 floor while four of five charges fall below it.
+        has a mean above the ₹1 Payment Links floor while four of five charges
+        fall below it.
         """
         amounts = [500, 50, 50, 50, 50]
         for index, amount in enumerate(amounts):

@@ -19,10 +19,16 @@ fee it does not, and anyone at a payments company will spot that immediately:
 The real barriers to per-request INR settlement are these, in order of how
 much they actually bite:
 
-  1. **The gateway minimum.** Razorpay will not process an order below ₹1.00.
-     A ₹0.50 API call is not expensive to settle individually — it is
-     *impossible*. Batching is what makes sub-rupee pricing exist at all, and
-     sub-rupee is exactly where agent API pricing wants to sit.
+  1. **The gateway minimum.** The Razorpay Payment Links API will not accept
+     an amount below ₹1.00 — the docs word it as "minimum 100 for INR", and
+     posting 50 paise to the test API returns exactly that rejection. A ₹0.50
+     API call is not expensive to settle individually — it is *impossible*.
+     Batching is what makes sub-rupee pricing exist at all, and sub-rupee is
+     exactly where agent API pricing wants to sit.
+
+     Scope: this is a Payment Links limit, observed and documented for that
+     product. It is not a claim about every Razorpay product, about UPI, or
+     about NPCI rails. See docs/research-sources.md.
 
   2. **Checkout has a human in it.** A Payment Link is a hosted page somebody
      opens and pays on. You cannot put that in the path of an HTTP request an
@@ -333,7 +339,8 @@ class RazorpayGateway:
             works against Razorpay today.
           * `reserve_pay` — a simulated mandate debit. See reserve_pay.py for
             what it does and does not model, and why it is the right shape for
-            agent traffic even though it does not fix the ₹1 floor.
+            agent traffic even though it does not fix the ₹1 Payment Links
+            floor.
 
         Args:
             amount_paise: Total to charge.

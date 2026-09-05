@@ -23,7 +23,7 @@
       <div>
         <div class="topbar__title">Bharat x402</div>
         <div class="topbar__subtitle">
-          INR settlement facilitator for Cloudflare's x402 agent-payment protocol
+          INR authorization and settlement facilitator for the x402 agent-payment protocol
         </div>
       </div>
     </div>
@@ -117,7 +117,10 @@
       <div class="panel__head panel__head--row">
         <div>
           <h2>Publisher dashboard</h2>
-          <p class="panel__sub">Bharat News Network — revenue from AI crawler traffic.</p>
+          <p class="panel__sub">
+            Bharat News Network — AI crawler traffic, <span id="stat-agents">0</span> agent<span
+              id="stat-agents-plural">s</span>.
+          </p>
         </div>
         <div class="scope-toggle" role="group" aria-label="Dashboard scope">
           <button class="scope-toggle__btn is-active" data-scope="mine" type="button">
@@ -129,18 +132,33 @@
         </div>
       </div>
 
-      <div class="stat-row">
+      <!--
+        Four numbers, not one labelled "earned". Accrued and collected are
+        different questions and a dashboard that answers only the first, using
+        the second's word, overstates revenue. Outstanding is the gap between
+        them — the publisher's actual credit exposure, and the number that makes
+        deferred settlement honest rather than invisible.
+      -->
+      <div class="stat-row stat-row--four">
         <div class="stat-tile">
-          <div class="stat-tile__value" id="stat-revenue">₹0.00</div>
-          <div class="stat-tile__label">earned</div>
+          <div class="stat-tile__value" id="stat-accrued">₹0.00</div>
+          <div class="stat-tile__label">accrued</div>
+          <div class="stat-tile__hint">owed, not yet collected</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-tile__value" id="stat-collected">₹0.00</div>
+          <div class="stat-tile__label">collected</div>
+          <div class="stat-tile__hint">gateway-confirmed</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-tile__value" id="stat-outstanding">₹0.00</div>
+          <div class="stat-tile__label">outstanding</div>
+          <div class="stat-tile__hint">credit exposure</div>
         </div>
         <div class="stat-tile">
           <div class="stat-tile__value" id="stat-requests">0</div>
-          <div class="stat-tile__label">paid requests</div>
-        </div>
-        <div class="stat-tile">
-          <div class="stat-tile__value" id="stat-agents">0</div>
-          <div class="stat-tile__label">agents</div>
+          <div class="stat-tile__label">authorized</div>
+          <div class="stat-tile__hint">requests fulfilled</div>
         </div>
       </div>
 
