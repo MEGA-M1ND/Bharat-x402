@@ -35,3 +35,8 @@ Thumbs.db
 # turn the keypair back into the shared secret it was built to replace.
 .keys/
 *.key
+
+# Hypothesis's example database and constant cache. Machine-local state that
+# speeds up repeat runs; committing it would add churn to every diff and
+# would not make anyone else's runs reproducible.
+.hypothesis/

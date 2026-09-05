@@ -29,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r facilitator/requirements.txt
           pip install -r demo-agent/requirements.txt
-          pip install pytest ruff
+          pip install -r requirements-dev.txt
           # Just `anthropic`, not agent-kit/requirements.txt: that also pulls in
           # the MCP SDK, which wants Starlette 1.x while FastAPI 0.115 pins <0.42.
           # Installing both breaks the facilitator at import. This one package has
@@ -88,7 +88,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r facilitator/requirements.txt
-          pip install pytest
+          pip install -r requirements-dev.txt
           # Just `anthropic`, not agent-kit/requirements.txt: that also pulls in
           # the MCP SDK, which wants Starlette 1.x while FastAPI 0.115 pins <0.42.
           # Installing both breaks the facilitator at import. This one package has
@@ -141,7 +141,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r facilitator/requirements.txt -r demo-agent/requirements.txt
-          pip install pytest
+          pip install -r requirements-dev.txt
           # Just `anthropic`, not agent-kit/requirements.txt: that also pulls in
           # the MCP SDK, which wants Starlette 1.x while FastAPI 0.115 pins <0.42.
           # Installing both breaks the facilitator at import. This one package has

@@ -509,6 +509,77 @@ CREATE TABLE IF NOT EXISTS commitments (
     FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
 );
 
+-- ======================================================================
+-- DOUBLE-ENTRY JOURNAL
+-- ======================================================================
+-- The status columns above answer "where is this commitment?". They cannot
+-- answer "what happened to the money, in what order, and does it add up?" —
+-- and a refund allocated across an aggregate collection, or a write-off that
+-- has to leave a trail, needs the second question answered.
+--
+-- Two rules make this a journal rather than a log:
+--
+--   1. Every money-changing operation posts a transaction whose debits equal
+--      its credits. Enforced in `post_journal` before commit.
+--   2. Nothing is ever updated or deleted. An error is corrected by posting a
+--      COMPENSATING transaction that references the original, so the books
+--      show both what was believed and what turned out to be true.
+--
+-- See docs/adr/0004-integer-paise-and-accounting-invariants.md.
+
+-- The chart of accounts. Seeded by `_seed_accounts`, not by a migration, so
+-- there is one definition of what an account means.
+CREATE TABLE IF NOT EXISTS accounts (
+    account_code   TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    -- asset | liability | equity | revenue | expense
+    account_type   TEXT NOT NULL,
+    -- debit | credit. Which direction increases this account, so a report can
+    -- present a balance with the right sign without hardcoding a list.
+    normal_balance TEXT NOT NULL
+);
+
+-- One economic event. Immutable once posted.
+CREATE TABLE IF NOT EXISTS journal_transactions (
+    txn_id       TEXT PRIMARY KEY,
+    -- The idempotency key, and the reason a retry after an unknown gateway
+    -- outcome is safe: a replayed command finds this row and posts nothing.
+    -- UNIQUE is what enforces it, not application logic remembering to check.
+    command_ref  TEXT NOT NULL UNIQUE,
+    txn_type     TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,
+    posted_at    TEXT NOT NULL,
+    description  TEXT,
+    -- Set on a compensating transaction, naming the one it reverses. The
+    -- original stays exactly as posted.
+    reverses_txn_id TEXT,
+    FOREIGN KEY (reverses_txn_id) REFERENCES journal_transactions (txn_id)
+);
+
+-- The legs. Debits and credits of one transaction must sum equal.
+--
+-- `amount_paise` is always POSITIVE; `direction` carries the sign. Signed
+-- amounts plus a direction column would let the same fact be represented two
+-- ways, and a balance check would then have to guess which convention a row
+-- was written under.
+CREATE TABLE IF NOT EXISTS journal_entries (
+    entry_id      TEXT PRIMARY KEY,
+    txn_id        TEXT NOT NULL,
+    account_code  TEXT NOT NULL,
+    -- debit | credit
+    direction     TEXT NOT NULL,
+    amount_paise  INTEGER NOT NULL,
+    -- Dimensions, so a balance can be sliced without joining back through
+    -- three tables. Nullable: not every posting has every dimension.
+    agent_id      TEXT,
+    operator_id   TEXT,
+    merchant_id   TEXT,
+    commitment_id TEXT,
+    batch_id      TEXT,
+    FOREIGN KEY (txn_id) REFERENCES journal_transactions (txn_id),
+    FOREIGN KEY (account_code) REFERENCES accounts (account_code)
+);
+
 -- Append-only. Nothing in this table is ever updated or deleted; it is the
 -- audit trail you would hand an auditor or replay to reconstruct a day.
 CREATE TABLE IF NOT EXISTS events (
@@ -558,6 +629,11 @@ CREATE INDEX IF NOT EXISTS idx_commitments_operator ON commitments (operator_id,
 -- The sweeper's query: held reservations past their TTL.
 CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON reservations (status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_authority_operator ON authority_accounts (operator_id);
+-- Trial balance and per-account rollups.
+CREATE INDEX IF NOT EXISTS idx_journal_entries_account ON journal_entries (account_code);
+CREATE INDEX IF NOT EXISTS idx_journal_entries_txn ON journal_entries (txn_id);
+-- "Show me everything that happened to this receivable."
+CREATE INDEX IF NOT EXISTS idx_journal_entries_commitment ON journal_entries (commitment_id);
 """
 
 
@@ -607,6 +683,12 @@ class Ledger:
     def _init_schema(self) -> None:
         with _WRITE_LOCK, self._connect() as conn:
             conn.executescript(schema_sql(self.dialect))
+        # The chart of accounts is reference data, not schema. Seeded straight
+        # after the tables exist so a journal posting can never hit a missing
+        # account — `journal_entries.account_code` has a foreign key to it, so
+        # an unseeded database would fail at the first capture rather than at
+        # startup where it is diagnosable.
+        self.seed_accounts()
 
     # -- audit -------------------------------------------------------------
 
@@ -1454,6 +1536,252 @@ class Ledger:
             }
             for r in rows
         ]
+
+    # == double-entry journal ==============================================
+
+    def seed_accounts(self) -> int:
+        """Ensures the chart of accounts exists.
+
+        Idempotent, and seeded from `journal.CHART_OF_ACCOUNTS` rather than
+        from a migration — one definition of what an account means, in the
+        module that also defines what may be posted to it. A migration copy
+        would drift the moment an account was added.
+
+        Returns:
+            How many accounts were inserted (0 on every call after the first).
+        """
+        from journal import CHART_OF_ACCOUNTS
+
+        inserted = 0
+        with _WRITE_LOCK, self._connect() as conn:
+            for code, name, account_type, normal_balance in CHART_OF_ACCOUNTS:
+                result = conn.execute(
+                    "INSERT INTO accounts (account_code, name, account_type, normal_balance)"
+                    " VALUES (?, ?, ?, ?) ON CONFLICT (account_code) DO NOTHING",
+                    (code, name, account_type, normal_balance),
+                )
+                inserted += result.rowcount
+        return inserted
+
+    def post_journal(self, transaction) -> tuple[str, bool]:
+        """Writes a balanced transaction and its entries, exactly once.
+
+        Idempotency is the `command_ref` UNIQUE constraint, claimed with
+        `ON CONFLICT DO NOTHING` — not a "have we seen this?" SELECT. That
+        distinction is the whole reason a retry after an unknown gateway
+        outcome is safe: two concurrent replays cannot both observe an absent
+        row and both post.
+
+        `ON CONFLICT` rather than try/except for the dialect reason this file
+        keeps running into: in Postgres a failed statement aborts the entire
+        transaction, so the recovery SELECT would itself be refused. SQLite
+        hides that completely.
+
+        Args:
+            transaction: A `journal.Transaction`, already balanced by
+                `journal.build_transaction`.
+
+        Returns:
+            `(txn_id, posted)`. `posted` is False when this command had
+            already been applied, and the returned id is the original's — so a
+            caller can log what happened without needing to know which case it
+            hit.
+
+        Raises:
+            UnbalancedTransaction: Re-checked here as well as at build time.
+                One check is a behaviour; two is an invariant that survives
+                somebody constructing a Transaction directly.
+        """
+        from journal import UnbalancedTransaction
+
+        if transaction.total_debits != transaction.total_credits:
+            raise UnbalancedTransaction(
+                f"{transaction.txn_type}: debits {transaction.total_debits} != "
+                f"credits {transaction.total_credits}"
+            )
+
+        now = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            claimed = conn.execute(
+                "INSERT INTO journal_transactions (txn_id, command_ref, txn_type, occurred_at,"
+                " posted_at, description, reverses_txn_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (command_ref) DO NOTHING",
+                (
+                    transaction.txn_id,
+                    transaction.command_ref,
+                    transaction.txn_type,
+                    now,
+                    now,
+                    transaction.description,
+                    transaction.reverses_txn_id,
+                ),
+            )
+            if claimed.rowcount == 0:
+                existing = conn.execute(
+                    "SELECT txn_id FROM journal_transactions WHERE command_ref = ?",
+                    (transaction.command_ref,),
+                ).fetchone()
+                return (existing["txn_id"] if existing else transaction.txn_id), False
+
+            for index, entry in enumerate(transaction.entries):
+                conn.execute(
+                    "INSERT INTO journal_entries (entry_id, txn_id, account_code, direction,"
+                    " amount_paise, agent_id, operator_id, merchant_id, commitment_id, batch_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"{transaction.txn_id}_{index}",
+                        transaction.txn_id,
+                        entry.account_code,
+                        entry.direction,
+                        entry.amount_paise,
+                        entry.agent_id,
+                        entry.operator_id,
+                        entry.merchant_id,
+                        entry.commitment_id,
+                        entry.batch_id,
+                    ),
+                )
+
+        return transaction.txn_id, True
+
+    def account_balance(self, account_code: str, *, agent_id: str | None = None) -> int:
+        """Net balance of one account, in its own normal direction.
+
+        Returned positive when the account holds what it normally holds — a
+        receivable with money owed to us is a positive number, not a negative
+        one that a reader has to remember the convention for.
+
+        `CAST(... AS BIGINT)` because Postgres returns `SUM()` as `Decimal`,
+        which is not JSON-serialisable and would 500 the endpoint that renders
+        it while every SQLite test passed. This file has been bitten by that
+        exact difference before.
+        """
+        sql = (
+            "SELECT"
+            " CAST(COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount_paise ELSE 0 END), 0)"
+            "  AS BIGINT) AS debits,"
+            " CAST(COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_paise ELSE 0 END), 0)"
+            "  AS BIGINT) AS credits"
+            " FROM journal_entries WHERE account_code = ?"
+        )
+        params: list[Any] = [account_code]
+        if agent_id:
+            sql += " AND agent_id = ?"
+            params.append(agent_id)
+
+        with self._connect() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+            normal = conn.execute(
+                "SELECT normal_balance FROM accounts WHERE account_code = ?", (account_code,)
+            ).fetchone()
+
+        debits = int(row["debits"]) if row else 0
+        credits = int(row["credits"]) if row else 0
+        if normal is not None and normal["normal_balance"] == "credit":
+            return credits - debits
+        return debits - credits
+
+    def trial_balance(self) -> dict:
+        """Every account's debits and credits, plus whether the books balance.
+
+        The check an auditor runs first, and the one that catches a whole class
+        of bug at once: if total debits do not equal total credits across the
+        entire journal, something posted an unbalanced transaction and every
+        figure derived from the journal is suspect.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT a.account_code, a.name, a.account_type, a.normal_balance,"
+                " CAST(COALESCE(SUM(CASE WHEN e.direction = 'debit' THEN e.amount_paise"
+                "   ELSE 0 END), 0) AS BIGINT) AS debits,"
+                " CAST(COALESCE(SUM(CASE WHEN e.direction = 'credit' THEN e.amount_paise"
+                "   ELSE 0 END), 0) AS BIGINT) AS credits"
+                " FROM accounts a LEFT JOIN journal_entries e"
+                "   ON e.account_code = a.account_code"
+                " GROUP BY a.account_code, a.name, a.account_type, a.normal_balance"
+                " ORDER BY a.account_code",
+                (),
+            ).fetchall()
+
+        accounts = []
+        total_debits = 0
+        total_credits = 0
+        for row in rows:
+            debits = int(row["debits"])
+            credits = int(row["credits"])
+            total_debits += debits
+            total_credits += credits
+            balance = (
+                credits - debits if row["normal_balance"] == "credit" else debits - credits
+            )
+            accounts.append(
+                {
+                    "accountCode": row["account_code"],
+                    "name": row["name"],
+                    "accountType": row["account_type"],
+                    "normalBalance": row["normal_balance"],
+                    "debitsPaise": debits,
+                    "creditsPaise": credits,
+                    "balancePaise": balance,
+                }
+            )
+
+        return {
+            "accounts": accounts,
+            "totalDebitsPaise": total_debits,
+            "totalCreditsPaise": total_credits,
+            "balanced": total_debits == total_credits,
+        }
+
+    def journal_entries_for(
+        self, *, commitment_id: str | None = None, batch_id: str | None = None
+    ) -> list[dict]:
+        """Everything that happened to one receivable or one batch.
+
+        The reconciler's view, and the answer to "why is this number what it
+        is?" — which a status column can never give, because it only holds the
+        latest state.
+        """
+        sql = (
+            "SELECT e.*, t.txn_type, t.posted_at, t.description, t.reverses_txn_id"
+            " FROM journal_entries e JOIN journal_transactions t ON t.txn_id = e.txn_id"
+            " WHERE 1 = 1"
+        )
+        params: list[Any] = []
+        if commitment_id:
+            sql += " AND e.commitment_id = ?"
+            params.append(commitment_id)
+        if batch_id:
+            sql += " AND e.batch_id = ?"
+            params.append(batch_id)
+        sql += " ORDER BY t.posted_at, e.entry_id"
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+
+        return [
+            {
+                "entryId": r["entry_id"],
+                "txnId": r["txn_id"],
+                "txnType": r["txn_type"],
+                "postedAt": r["posted_at"],
+                "description": r["description"],
+                "accountCode": r["account_code"],
+                "direction": r["direction"],
+                "amountPaise": r["amount_paise"],
+                "agentId": r["agent_id"],
+                "commitmentId": r["commitment_id"],
+                "batchId": r["batch_id"],
+                "reversesTxnId": r["reverses_txn_id"],
+            }
+            for r in rows
+        ]
+
+    def get_journal_transaction(self, command_ref: str) -> Mapping[str, Any] | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM journal_transactions WHERE command_ref = ?", (command_ref,)
+            ).fetchone()
 
     # -- authority accounts and reservations -------------------------------
 

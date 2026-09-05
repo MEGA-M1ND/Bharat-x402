@@ -358,6 +358,77 @@ CREATE TABLE IF NOT EXISTS commitments (
     FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
 );
 
+-- ======================================================================
+-- DOUBLE-ENTRY JOURNAL
+-- ======================================================================
+-- The status columns above answer "where is this commitment?". They cannot
+-- answer "what happened to the money, in what order, and does it add up?" —
+-- and a refund allocated across an aggregate collection, or a write-off that
+-- has to leave a trail, needs the second question answered.
+--
+-- Two rules make this a journal rather than a log:
+--
+--   1. Every money-changing operation posts a transaction whose debits equal
+--      its credits. Enforced in `post_journal` before commit.
+--   2. Nothing is ever updated or deleted. An error is corrected by posting a
+--      COMPENSATING transaction that references the original, so the books
+--      show both what was believed and what turned out to be true.
+--
+-- See docs/adr/0004-integer-paise-and-accounting-invariants.md.
+
+-- The chart of accounts. Seeded by `_seed_accounts`, not by a migration, so
+-- there is one definition of what an account means.
+CREATE TABLE IF NOT EXISTS accounts (
+    account_code   TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    -- asset | liability | equity | revenue | expense
+    account_type   TEXT NOT NULL,
+    -- debit | credit. Which direction increases this account, so a report can
+    -- present a balance with the right sign without hardcoding a list.
+    normal_balance TEXT NOT NULL
+);
+
+-- One economic event. Immutable once posted.
+CREATE TABLE IF NOT EXISTS journal_transactions (
+    txn_id       TEXT PRIMARY KEY,
+    -- The idempotency key, and the reason a retry after an unknown gateway
+    -- outcome is safe: a replayed command finds this row and posts nothing.
+    -- UNIQUE is what enforces it, not application logic remembering to check.
+    command_ref  TEXT NOT NULL UNIQUE,
+    txn_type     TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,
+    posted_at    TEXT NOT NULL,
+    description  TEXT,
+    -- Set on a compensating transaction, naming the one it reverses. The
+    -- original stays exactly as posted.
+    reverses_txn_id TEXT,
+    FOREIGN KEY (reverses_txn_id) REFERENCES journal_transactions (txn_id)
+);
+
+-- The legs. Debits and credits of one transaction must sum equal.
+--
+-- `amount_paise` is always POSITIVE; `direction` carries the sign. Signed
+-- amounts plus a direction column would let the same fact be represented two
+-- ways, and a balance check would then have to guess which convention a row
+-- was written under.
+CREATE TABLE IF NOT EXISTS journal_entries (
+    entry_id      TEXT PRIMARY KEY,
+    txn_id        TEXT NOT NULL,
+    account_code  TEXT NOT NULL,
+    -- debit | credit
+    direction     TEXT NOT NULL,
+    amount_paise  INTEGER NOT NULL,
+    -- Dimensions, so a balance can be sliced without joining back through
+    -- three tables. Nullable: not every posting has every dimension.
+    agent_id      TEXT,
+    operator_id   TEXT,
+    merchant_id   TEXT,
+    commitment_id TEXT,
+    batch_id      TEXT,
+    FOREIGN KEY (txn_id) REFERENCES journal_transactions (txn_id),
+    FOREIGN KEY (account_code) REFERENCES accounts (account_code)
+);
+
 -- Append-only. Nothing in this table is ever updated or deleted; it is the
 -- audit trail you would hand an auditor or replay to reconstruct a day.
 CREATE TABLE IF NOT EXISTS events (
@@ -407,3 +478,8 @@ CREATE INDEX IF NOT EXISTS idx_commitments_operator ON commitments (operator_id,
 -- The sweeper's query: held reservations past their TTL.
 CREATE INDEX IF NOT EXISTS idx_reservations_expiry ON reservations (status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_authority_operator ON authority_accounts (operator_id);
+-- Trial balance and per-account rollups.
+CREATE INDEX IF NOT EXISTS idx_journal_entries_account ON journal_entries (account_code);
+CREATE INDEX IF NOT EXISTS idx_journal_entries_txn ON journal_entries (txn_id);
+-- "Show me everything that happened to this receivable."
+CREATE INDEX IF NOT EXISTS idx_journal_entries_commitment ON journal_entries (commitment_id);

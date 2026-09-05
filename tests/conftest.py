@@ -90,9 +90,23 @@ def _reset_postgres_ledger(dsn: str) -> None:
             "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events,"
             " operators, merchants, api_credentials, agent_credentials,"
             " enrollment_challenges, spending_consents, consent_publishers,"
-            " authority_accounts, reservations"
+            " authority_accounts, reservations,"
+            " journal_transactions, journal_entries"
             " RESTART IDENTITY CASCADE"
         )
+        # `accounts` is deliberately NOT truncated. It is reference data — the
+        # chart of accounts — not test state, and `journal_entries` has a
+        # foreign key to it. Emptying it between tests would make the first
+        # journal posting of the next test fail on a missing account, which
+        # would look like a bug in the journal rather than in this fixture.
+        #
+        # Seeded explicitly here rather than relying on Ledger.__init__,
+        # because on Postgres that only runs under LEDGER_AUTO_MIGRATE and a
+        # test that constructs a Ledger without it would otherwise find no
+        # accounts at all.
+        from ledger import Ledger
+
+        Ledger(dsn).seed_accounts()
 
 
 # The five switches whose *production* default is closed, and which the bulk

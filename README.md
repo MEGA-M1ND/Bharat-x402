@@ -180,7 +180,15 @@ sequenceDiagram
     participant F as Bharat x402<br/>facilitator
     participant R as Razorpay
 
-    A->>F: POST /agents/register (Ed25519 public key, once)
+    participant O as Operator
+
+    Note over O,F: — once, authenticated —
+    O->>F: POST /control/agents/challenge
+    F-->>O: single-use nonce
+    O->>F: POST /control/agents/enroll (nonce signed by the agent key)
+    O->>F: POST /control/consents (limits in paise, publisher scope)
+    F-->>O: consent + authority account
+
     A->>P: GET /premium/api-call
     P-->>A: 402 · accepts[{razorpay-inr, 50 paise}]
     A->>F: POST /offer
@@ -188,17 +196,25 @@ sequenceDiagram
     Note over A: sign acceptance with<br/>its own private key
     A->>P: GET + X-PAYMENT
     P->>F: POST /verify
+    Note over F: consent checked,<br/>authority RESERVED
     F-->>P: isValid: true
     Note over P: handler runs,<br/>response buffered
     P->>F: POST /settle
+    Note over F: reservation captured,<br/>journal posts Dr receivable / Cr payable
     F-->>P: commitment cmt_… · no rupees moved
     P-->>A: 200 · content + receipt
     Note over F,R: — end of day —
     F->>R: ONE Payment Link for N commitments
     R-->>F: plink_…
     R->>F: webhook payment_link.paid (signed)
-    Note over F: batch → paid.<br/>Only now is it revenue.
+    Note over F: journal posts Dr clearing / Cr receivable.<br/>Only now is it collected.
 ```
+
+The two boxed steps are what changed. **The reservation is why content is
+released at all** — before it, a pseudonymous key promised to pay and the
+publisher took the promise. And `/settle` posts to a double-entry journal that
+credits *publisher payable*, not revenue: no money has arrived, and crediting
+revenue there would be this project's own argument made wrong, in accounts.
 
 ### This is a real x402 deployment, not a lookalike
 
@@ -510,13 +526,22 @@ This is a portfolio demo, not a payment system.
   holding a key that can move real money.
 - It runs fully offline with `MOCK_RAZORPAY=true`, which is the default. Set your own
   `rzp_test_` keys and flip it to `false` to create real test-mode links.
-- **Agent identity is trust-on-first-use.** The first caller to claim an agent id owns it,
-  because there is nothing here to bind that id to. Production would issue the key at
-  onboarding, alongside the merchant account it settles into. Rebinding is refused rather than
-  allowed, so at least key rotation and account takeover are not the same request.
-- **The HMAC fallback is still on** (`ALLOW_HMAC_FALLBACK=true`) so unregistered agents keep
-  working during migration. Every fallback verification is logged as a downgrade. Turning it off
-  makes registration mandatory, and the suite covers that end state.
+- **The hosted demo runs five security controls open, and says so on the page.** A browser
+  cannot hold an API key, and the point of that deployment is that a stranger can click it —
+  so `DEMO_OPEN_DASHBOARD`, `DEMO_UNSAFE_TOFU`, `ALLOW_HMAC_FALLBACK`, `REQUIRE_CONSENT=false`
+  and `AUTHORITY_REQUIRED=false` are all set there. **Every one of them is closed by default.**
+  The facilitator logs `insecure_demo_mode_enabled` naming each at startup, `/health` publishes
+  the profile, and the console renders a card listing each relaxation next to what the
+  production-like default is — because reporting it only in a log means the people looking at
+  the demo never see it. `tests/test_control_plane.py` runs with all five cleared and asserts,
+  endpoint by endpoint, what a closed deployment refuses.
+- **There is no KYC.** An operator is a row with a display name. Ed25519 proves *key
+  continuity*, and an authenticated enrollment proves *possession* — neither proves anybody is
+  who they say they are, and nothing here binds an operator to a legal entity you could invoice.
+- **The authority balances are not money.** `prefunded` is a test-mode top-up, not a received
+  payment; `simulated_reserve` models UPI Reserve Pay's block/debit shape with no NPCI mandate
+  behind it and reports `"simulated": true` in its own payload. The *accounting* and the
+  concurrency guarantees are real; the funds are not.
 - **No UPI Reserve Pay integration** — it is in closed beta, so settlement here is Payment Links,
   which is why a human-facing checkout page still appears in a machine-to-machine flow.
 - **The hosted demo keeps itself alive with a daily cron.** Supabase pauses a free-tier project
@@ -534,9 +559,20 @@ Every simplification is listed with what production would change in
 
 ## Where this would go next
 
-1. **A real UPI Reserve Pay integration.** The simulated one is built (see above); the real
-   thing needs closed-beta access. That swap is the last genuine gap between this and
-   something a publisher could run.
+The work is planned in phases in [docs/implementation-plan.md](docs/implementation-plan.md).
+Phases 1–4 are done — correct domain model, authenticated operators and consent, reserved
+authority, and the double-entry journal. **Phases 5–9 are not started**, and the largest of
+them is the one that matters most:
+
+1. **Collection failure, refunds, and reconciliation (Phase 5).** The journal and the
+   allocation arithmetic exist and are property-tested; what does not exist yet is the
+   reconciler that compares our records against Razorpay's and classifies the differences —
+   missing webhook, charge without a batch, amount mismatch, stale pending batch. Deferred
+   collection makes failure a routine path rather than an edge case, so this is not optional
+   polish; it is the half of the product that handles the day things go wrong.
+2. **A real UPI Reserve Pay integration.** The simulated one is built; the real thing needs
+   access Razorpay gates behind a support request. That swap is the last genuine gap between
+   this and something a publisher could run.
 2. **Expose the facilitator over MCP** — done for the *agent* side (`agent-kit/mcp_server.py`);
    the publisher's own `/economics` and `/settle-batch` would be the operator-facing half.
 3. **Real x402 interop** — advertise both `razorpay-inr` and USDC-on-Base in `accepts[]` and let

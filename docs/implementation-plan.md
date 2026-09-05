@@ -41,6 +41,22 @@ Environment note: the repository's `.venv` is the only environment with `psycopg
 
 ---
 
+## Where this landed
+
+Phases 1–4 are complete and committed. Phases 5–9 are not started, and the
+repository is left at a clean boundary: the money lifecycle is representable end
+to end (authority → reservation → fulfillment → receivable → collection →
+confirmation), every money-changing operation posts a balanced journal
+transaction, and no schema is half-migrated.
+
+| Check | Baseline | Now |
+| --- | --- | --- |
+| `pytest -q` | 207 passed, 10 skipped | **362 passed** |
+| `ruff check` | clean | clean |
+| `node --check` | clean | clean |
+| Migrations | 003 | **006** |
+| Publicly readable operational endpoints | 4 | **0** |
+
 ## Phase status
 
 - [x] **Phase 0** — Survey, primary-source research, gap analysis, baseline

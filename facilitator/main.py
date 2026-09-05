@@ -45,6 +45,7 @@ from typing import Any
 
 import authority
 import consent
+import journal
 from authority import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     AuthorityError,
@@ -1290,6 +1291,27 @@ def settle(request: X402Request) -> JSONResponse:
             reservation_id=reservation["reservation_id"],
             commitment_id=commitment["commitmentId"],
         )
+
+    # The journal posting for the same event.
+    #
+    # `command_ref` is derived from the COMMITMENT id, not generated per
+    # attempt: that is what makes a retried settlement post nothing instead of
+    # a second set of entries. A UUID per call would defeat the whole
+    # idempotency mechanism while looking correct.
+    #
+    # Debits agent receivable, credits publisher payable. Note what it does not
+    # credit: revenue. No money has arrived, and crediting revenue here would
+    # be this project's own argument, made wrong, in accounts.
+    ledger.post_journal(
+        journal.capture_usage(
+            command_ref=f"capture:{commitment['commitmentId']}",
+            amount_paise=commitment["amountPaise"],
+            agent_id=commitment["agentId"],
+            operator_id=operator_id,
+            merchant_id=FACILITATOR_MERCHANT_ID,
+            commitment_id=commitment["commitmentId"],
+        )
+    )
 
     ledger.log_event(
         "commitment_recorded",
