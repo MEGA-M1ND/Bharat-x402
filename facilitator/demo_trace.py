@@ -39,6 +39,7 @@ import hmac
 import json
 import re
 import time
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -172,7 +173,85 @@ def _ensure_registered(agent_id: str) -> str:
         # at verification rather than silently rebinding, which is exactly
         # the takeover the registration guard exists to prevent.
         pass
+    _ensure_authority(agent_id)
     return private_b64
+
+
+# The operator every console session's agent is enrolled under.
+#
+# One shared demo operator rather than one per visitor: an operator is the
+# party that answers for spending, and inventing a distinct legal-ish entity
+# per browser tab would be less honest, not more.
+DEMO_OPERATOR_ID = "op_console_demo"
+
+# What each console session's authority account is funded with, in paise.
+# ₹500.00 — enough for a long play with the ₹0.50 API call, small enough that
+# the balance visibly moves.
+DEMO_FUNDING_PAISE = 50_000
+
+
+def _ensure_authority(agent_id: str) -> None:
+    """Gives the console's simulated agent a consent and a funded balance.
+
+    WHY THIS EXISTS RATHER THAN JUST SETTING AUTHORITY_REQUIRED=false: the
+    console is the only place most people will ever see this system, and
+    switching off the control that Phase 3 is *about* would mean the demo
+    never exercises it. Provisioning real authority instead means the console
+    runs the same path a production deployment does — consent evaluated,
+    amount reserved before the handler, reservation captured on fulfillment —
+    and the numbers on the dashboard are produced by that path rather than
+    around it.
+
+    Everything here is test-mode: the operator is a row with a display name,
+    and the funding is an assertion that this much stands behind the consent,
+    not a received payment. The `simulated` flag on the authority payload says
+    so to any client that reads it.
+
+    Idempotent, and deliberately forgiving: a console session that cannot be
+    provisioned should degrade to whatever the deployment's flags allow rather
+    than 500. If AUTHORITY_REQUIRED is on, the negotiation will then refuse
+    with `no_authority`, which is the correct and legible outcome.
+    """
+    ledger = _ctx["ledger"]
+    try:
+        if ledger.get_operator(DEMO_OPERATOR_ID) is None:
+            ledger.create_operator(
+                operator_id=DEMO_OPERATOR_ID, display_name="Console demo operator"
+            )
+    except ValueError:
+        # Lost a race with a concurrent session. Fine — it exists either way.
+        pass
+
+    if ledger.active_consent_for_agent(agent_id) is not None:
+        return
+
+    consent_id = f"con_demo_{uuid.uuid4().hex[:12]}"
+    ledger.create_consent(
+        consent_id=consent_id,
+        operator_id=DEMO_OPERATOR_ID,
+        agent_id=agent_id,
+        # Generous, because a visitor clicking twenty times should not hit a
+        # limit they were never told about. The limits are demonstrated by the
+        # control-plane tests, not by frustrating the demo.
+        per_request_limit_paise=10_000,
+        daily_limit_paise=DEMO_FUNDING_PAISE,
+        total_limit_paise=DEMO_FUNDING_PAISE,
+    )
+    ledger.create_authority_account(
+        account_id=f"aut_demo_{uuid.uuid4().hex[:12]}",
+        consent_id=consent_id,
+        operator_id=DEMO_OPERATOR_ID,
+        backing="prefunded",
+        funded_paise=DEMO_FUNDING_PAISE,
+    )
+    ledger.log_event(
+        "demo_authority_provisioned",
+        agent_id=agent_id,
+        status="ok",
+        consentId=consent_id,
+        fundedPaise=DEMO_FUNDING_PAISE,
+        note="Test-mode console session. Not a received payment.",
+    )
 
 
 # Mirrors the paths registered in resource-server/x402-config.js. The two

@@ -180,6 +180,15 @@ jobs:
           DEMO_UNSAFE_TOFU: "true"
           REQUIRE_CONSENT: "false"
           ALLOW_HMAC_FALLBACK: "true"
+          # Needed by demo-agent/crawler_agent.py, which registers over HTTP
+          # under trust-on-first-use and has no operator behind it.
+          #
+          # The CONSOLE does not need this: facilitator/demo_trace.py
+          # provisions a real consent and a funded authority account for each
+          # session, so /demo/run exercises the reservation path whether the
+          # flag is on or off. Switching the control off for the demo would
+          # have meant the thing Phase 3 is about was never demonstrated.
+          AUTHORITY_REQUIRED: "false"
         run: |
           cd facilitator
           nohup python -m uvicorn main:app --port 8402 > /tmp/facilitator.log 2>&1 &
