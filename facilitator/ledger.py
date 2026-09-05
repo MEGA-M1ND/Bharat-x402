@@ -55,6 +55,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -172,16 +173,177 @@ def schema_sql(dialect: str) -> str:
         dialect: "sqlite" or "postgres".
     """
     return f"""
+-- ======================================================================
+-- IDENTITY AND CONSENT
+-- ======================================================================
+-- Declared first because `agents`, `api_credentials`, and `spending_consents`
+-- all reference them. Postgres resolves foreign keys at CREATE TABLE time and
+-- errors if the referenced table does not exist yet; SQLite resolves lazily
+-- and would not have caught the ordering. Same trap as `batches` before
+-- `commitments`.
+
+-- The party that answers for an agent's spending. An agent is a *process*;
+-- an operator is who you would invoice, suspend, or argue with.
+--
+-- This is the entity the original design was missing entirely. Without it a
+-- pseudonymous key promised to pay and content was released on that promise,
+-- with nothing standing behind it. See docs/adr/0001.
+CREATE TABLE IF NOT EXISTS operators (
+    operator_id  TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    -- active | suspended | closed
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL
+);
+
+-- The publisher being paid. Consents are scoped to these, so an operator can
+-- authorise spend at one publisher without authorising it everywhere.
+CREATE TABLE IF NOT EXISTS merchants (
+    merchant_id                  TEXT PRIMARY KEY,
+    display_name                 TEXT NOT NULL,
+    -- Where collected value would eventually be paid out. Opaque here: this
+    -- project never performs a payout.
+    settlement_account_reference TEXT,
+    status                       TEXT NOT NULL DEFAULT 'active',
+    created_at                   TEXT NOT NULL
+);
+
+-- Control-plane API keys.
+--
+-- Only the HASH is stored. The plaintext is returned once, at issuance, and
+-- is unrecoverable afterwards — so a disclosure of this table yields nothing
+-- an attacker can authenticate with. `key_prefix` is a non-secret fragment
+-- kept so a human can tell two keys apart in a listing without the listing
+-- being a credential dump.
+CREATE TABLE IF NOT EXISTS api_credentials (
+    credential_id TEXT PRIMARY KEY,
+    -- Exactly one of these is set: the tenant this key speaks for. Enforced
+    -- in `create_api_credential` rather than by a CHECK, because the check
+    -- would have to differ per dialect.
+    operator_id   TEXT,
+    merchant_id   TEXT,
+    label         TEXT NOT NULL,
+    key_prefix    TEXT NOT NULL,
+    key_hash      TEXT NOT NULL UNIQUE,
+    -- Space-separated scope tokens. A string rather than a join table: scopes
+    -- are read on every authenticated request and never queried across rows.
+    scopes        TEXT NOT NULL,
+    -- active | revoked
+    status        TEXT NOT NULL DEFAULT 'active',
+    created_at    TEXT NOT NULL,
+    last_used_at  TEXT,
+    revoked_at    TEXT,
+    -- Set on rotation, so an audit can follow a key's lineage.
+    replaced_by   TEXT,
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
+);
+
 -- One row per agent that has registered a signing key. Holds only the
 -- *public* half: the facilitator can verify an agent's commitments and can
 -- never produce one, which is the entire point of moving off a shared HMAC
 -- secret (see payment_verifier.py).
+--
+-- `public_key`/`algorithm` are retained as the *currently active* key. They
+-- are a denormalisation of `agent_credentials`, kept because every existing
+-- verification path reads them and because the join is on the hot path of
+-- every paid request. `agent_credentials` is authoritative for validity.
 CREATE TABLE IF NOT EXISTS agents (
     agent_id      TEXT PRIMARY KEY,
     -- base64 of the raw 32-byte Ed25519 public key.
     public_key    TEXT NOT NULL,
     algorithm     TEXT NOT NULL,
-    registered_at TEXT NOT NULL
+    registered_at TEXT NOT NULL,
+    -- Null for agents enrolled under trust-on-first-use, which is exactly the
+    -- gap this column exists to make visible.
+    operator_id   TEXT,
+    -- active | suspended | closed
+    status        TEXT NOT NULL DEFAULT 'active',
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- The signing-key lifecycle: enrollment, rotation, revocation, expiry.
+--
+-- Credentials are ROWS, not a column that gets overwritten, and that is the
+-- whole design. Revocation must stop *new* authorization without invalidating
+-- *past* evidence — an acceptance signed last week has to stay verifiable
+-- against the key that signed it, or rotating a key would silently destroy
+-- the audit trail that makes Ed25519 worth using at all.
+CREATE TABLE IF NOT EXISTS agent_credentials (
+    credential_id TEXT PRIMARY KEY,
+    agent_id      TEXT NOT NULL,
+    algorithm     TEXT NOT NULL,
+    public_key    TEXT NOT NULL,
+    -- active | superseded | revoked
+    status        TEXT NOT NULL DEFAULT 'active',
+    valid_from    TEXT NOT NULL,
+    -- Null means no expiry.
+    valid_until   TEXT,
+    revoked_at    TEXT,
+    replaced_by   TEXT,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+);
+
+-- Proof-of-possession challenges for authenticated key enrollment.
+--
+-- Replaces "the first caller to claim an id owns it". An operator asks for a
+-- challenge, the agent signs the nonce with the private key it claims to
+-- hold, and only a valid signature binds the public key. Single-use and
+-- time-limited, for the same reason offers are.
+CREATE TABLE IF NOT EXISTS enrollment_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    operator_id  TEXT NOT NULL,
+    agent_id     TEXT NOT NULL,
+    nonce        TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    consumed_at  TEXT,
+    created_at   TEXT NOT NULL,
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id)
+);
+
+-- An operator's standing authorisation for one agent to spend, with limits.
+--
+-- Modelled on the consent shape Razorpay and NPCI describe for UPI Reserve
+-- Pay: a one-time authorisation carrying spending limits, revocable at any
+-- time, under which an agent transacts without re-prompting. Every limit is
+-- integer paise.
+--
+-- `reserved_paise` and `consumed_paise` are the live counters. They move
+-- inside conditional UPDATEs (see authority.py), never read-then-write, so
+-- concurrent requests cannot jointly exceed one limit.
+CREATE TABLE IF NOT EXISTS spending_consents (
+    consent_id              TEXT PRIMARY KEY,
+    operator_id             TEXT NOT NULL,
+    agent_id                TEXT NOT NULL,
+    -- active | suspended | revoked | expired
+    status                  TEXT NOT NULL DEFAULT 'active',
+    currency                TEXT NOT NULL DEFAULT 'INR',
+    per_request_limit_paise INTEGER NOT NULL,
+    daily_limit_paise       INTEGER NOT NULL,
+    total_limit_paise       INTEGER NOT NULL,
+    reserved_paise          INTEGER NOT NULL DEFAULT 0,
+    consumed_paise          INTEGER NOT NULL DEFAULT 0,
+    valid_from              TEXT NOT NULL,
+    valid_until             TEXT,
+    created_at              TEXT NOT NULL,
+    revoked_at              TEXT,
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id),
+    FOREIGN KEY (agent_id) REFERENCES agents (agent_id)
+);
+
+-- Publisher scope for a consent. No rows means "any publisher"; one or more
+-- restricts the consent to exactly those merchants.
+--
+-- A join table rather than a list column because "which consents may spend at
+-- this merchant?" is a real query, and because a scope that is wrong is a
+-- scope that authorises spending somewhere it should not.
+CREATE TABLE IF NOT EXISTS consent_publishers (
+    consent_id  TEXT NOT NULL,
+    merchant_id TEXT NOT NULL,
+    PRIMARY KEY (consent_id, merchant_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id),
+    FOREIGN KEY (merchant_id) REFERENCES merchants (merchant_id)
 );
 
 CREATE TABLE IF NOT EXISTS offers (
@@ -247,10 +409,26 @@ CREATE TABLE IF NOT EXISTS commitments (
     -- deferred: awaiting batch. per_request: charged immediately.
     mode          TEXT NOT NULL,
     -- pending | settled | failed
+    --
+    -- Note on the word: `settled` here has always meant "assigned to a
+    -- batch", never "money arrived". It is retained because reporting and a
+    -- number of tests read it, and renaming a stored value is a data
+    -- migration rather than a rename. `collected` is the word reserved for
+    -- gateway-confirmed money, and lives on `batches.status`.
     status        TEXT NOT NULL DEFAULT 'pending',
     batch_id      TEXT,
+    -- Who answers for this debt, and under what authorisation.
+    --
+    -- Null on commitments booked before operators existed, and on any booked
+    -- through the unsafe demo path. A null here means "nobody is on the hook
+    -- for this but a pseudonymous key", which is precisely the state worth
+    -- being able to query for.
+    operator_id   TEXT,
+    consent_id    TEXT,
     FOREIGN KEY (offer_id) REFERENCES offers (offer_id),
-    FOREIGN KEY (batch_id) REFERENCES batches (batch_id)
+    FOREIGN KEY (batch_id) REFERENCES batches (batch_id),
+    FOREIGN KEY (operator_id) REFERENCES operators (operator_id),
+    FOREIGN KEY (consent_id) REFERENCES spending_consents (consent_id)
 );
 
 -- Append-only. Nothing in this table is ever updated or deleted; it is the
@@ -288,6 +466,17 @@ CREATE INDEX IF NOT EXISTS idx_commitments_settlement
     ON commitments (status, agent_id, settle_date);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
 CREATE INDEX IF NOT EXISTS idx_batches_payment_link ON batches (payment_link_id);
+
+-- The authentication hot path: every control-plane request hashes its bearer
+-- token and looks it up here.
+CREATE INDEX IF NOT EXISTS idx_api_credentials_hash ON api_credentials (key_hash);
+-- "Which key is currently active for this agent?" — read on every paid request.
+CREATE INDEX IF NOT EXISTS idx_agent_credentials_agent
+    ON agent_credentials (agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_consents_agent ON spending_consents (agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_agents_operator ON agents (operator_id);
+-- Tenant-scoped reads: "everything this operator is on the hook for".
+CREATE INDEX IF NOT EXISTS idx_commitments_operator ON commitments (operator_id, settle_date);
 """
 
 
@@ -527,10 +716,33 @@ class Ledger:
             # there is no read-then-write gap, the same reasoning as
             # `create_commitment` below.
             inserted = conn.execute(
-                "INSERT INTO agents (agent_id, public_key, algorithm, registered_at)"
-                " VALUES (?, ?, ?, ?) ON CONFLICT (agent_id) DO NOTHING",
+                "INSERT INTO agents (agent_id, public_key, algorithm, registered_at, status)"
+                " VALUES (?, ?, ?, ?, 'active') ON CONFLICT (agent_id) DO NOTHING",
                 (agent_id, public_key, algorithm, registered_at),
             )
+
+            if inserted.rowcount == 1:
+                # A credential row as well, in the same transaction.
+                #
+                # Verification reads `agent_credentials`, not `agents`, so a
+                # key registered through this legacy path must appear there
+                # too — otherwise a trust-on-first-use agent would register
+                # successfully and then be unable to pay, and worse, an
+                # operator revoking that credential would have nothing to
+                # revoke. One enrollment path, one lifecycle.
+                conn.execute(
+                    "INSERT INTO agent_credentials (credential_id, agent_id, algorithm,"
+                    " public_key, status, valid_from, created_at)"
+                    " VALUES (?, ?, ?, ?, 'active', ?, ?)",
+                    (
+                        f"agck_tofu_{uuid.uuid4().hex[:12]}",
+                        agent_id,
+                        algorithm,
+                        public_key,
+                        registered_at,
+                        registered_at,
+                    ),
+                )
 
             if inserted.rowcount == 0:
                 existing = conn.execute(
@@ -565,6 +777,618 @@ class Ledger:
             return conn.execute(
                 "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
             ).fetchone()
+
+    # == identity, credentials, and consent ================================
+    #
+    # Everything below is Phase 2. The methods above predate operators and are
+    # left untouched so the existing verification path keeps working; these
+    # add the authenticated control plane on top rather than rewriting it.
+
+    def create_operator(self, *, operator_id: str, display_name: str) -> dict:
+        """Registers an operator — the party that answers for an agent's spend."""
+        created_at = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            inserted = conn.execute(
+                "INSERT INTO operators (operator_id, display_name, status, created_at)"
+                " VALUES (?, ?, 'active', ?) ON CONFLICT (operator_id) DO NOTHING",
+                (operator_id, display_name, created_at),
+            )
+            if inserted.rowcount == 0:
+                raise ValueError(f"operator {operator_id} already exists")
+        return {
+            "operatorId": operator_id,
+            "displayName": display_name,
+            "status": "active",
+            "createdAt": created_at,
+        }
+
+    def get_operator(self, operator_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM operators WHERE operator_id = ?", (operator_id,)
+            ).fetchone()
+
+    def set_operator_status(self, *, operator_id: str, status: str) -> bool:
+        """Suspends, resumes, or closes an operator. Returns whether a row moved."""
+        with _WRITE_LOCK, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE operators SET status = ? WHERE operator_id = ?", (status, operator_id)
+            )
+            return result.rowcount > 0
+
+    def create_merchant(
+        self, *, merchant_id: str, display_name: str, settlement_account_reference: str | None
+    ) -> dict:
+        """Registers a publisher."""
+        created_at = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            inserted = conn.execute(
+                "INSERT INTO merchants (merchant_id, display_name,"
+                " settlement_account_reference, status, created_at)"
+                " VALUES (?, ?, ?, 'active', ?) ON CONFLICT (merchant_id) DO NOTHING",
+                (merchant_id, display_name, settlement_account_reference, created_at),
+            )
+            if inserted.rowcount == 0:
+                raise ValueError(f"merchant {merchant_id} already exists")
+        return {
+            "merchantId": merchant_id,
+            "displayName": display_name,
+            "settlementAccountReference": settlement_account_reference,
+            "status": "active",
+            "createdAt": created_at,
+        }
+
+    def get_merchant(self, merchant_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM merchants WHERE merchant_id = ?", (merchant_id,)
+            ).fetchone()
+
+    # -- API credentials ---------------------------------------------------
+
+    def create_api_credential(
+        self,
+        *,
+        credential_id: str,
+        operator_id: str | None,
+        merchant_id: str | None,
+        label: str,
+        key_prefix: str,
+        key_hash: str,
+        scopes: str,
+    ) -> dict:
+        """Stores the HASH of a newly issued API key.
+
+        The plaintext never reaches this method. It is generated, hashed, and
+        returned to its owner by the endpoint; only the digest is persisted,
+        so this table is not a credential store an attacker can use.
+
+        Raises:
+            ValueError: If neither or both tenant ids are given. A credential
+                that belongs to no tenant would authenticate as nobody, and
+                one belonging to two would be a cross-tenant hole by
+                construction — so this is refused here rather than left to a
+                CHECK constraint that would have to differ per dialect.
+        """
+        if bool(operator_id) == bool(merchant_id):
+            raise ValueError(
+                "an API credential must belong to exactly one tenant: "
+                "give operator_id or merchant_id, not neither and not both"
+            )
+
+        created_at = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO api_credentials (credential_id, operator_id, merchant_id, label,"
+                " key_prefix, key_hash, scopes, status, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+                (
+                    credential_id,
+                    operator_id,
+                    merchant_id,
+                    label,
+                    key_prefix,
+                    key_hash,
+                    scopes,
+                    created_at,
+                ),
+            )
+        return {
+            "credentialId": credential_id,
+            "operatorId": operator_id,
+            "merchantId": merchant_id,
+            "label": label,
+            "keyPrefix": key_prefix,
+            "scopes": scopes.split(),
+            "status": "active",
+            "createdAt": created_at,
+        }
+
+    def find_api_credential(self, key_hash: str) -> Mapping[str, Any] | None:
+        """Looks up an active credential by hash.
+
+        Filtering `status = 'active'` in SQL rather than in Python means a
+        revoked key cannot be authenticated by a caller that forgets to check
+        — the row simply is not returned.
+        """
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM api_credentials WHERE key_hash = ? AND status = 'active'",
+                (key_hash,),
+            ).fetchone()
+
+    def touch_api_credential(self, credential_id: str) -> None:
+        """Records last use, for the "is this key still needed?" question.
+
+        Best-effort and deliberately swallowed: a failure to update a
+        timestamp must never fail an otherwise-valid authenticated request.
+        """
+        try:
+            with _WRITE_LOCK, self._connect() as conn:
+                conn.execute(
+                    "UPDATE api_credentials SET last_used_at = ? WHERE credential_id = ?",
+                    (utc_now(), credential_id),
+                )
+        except Exception as exc:  # noqa: BLE001 - never fail a request over telemetry
+            self.log_event(
+                "credential_touch_failed",
+                status="degraded",
+                credentialId=credential_id,
+                error=redact_credentials(str(exc)),
+            )
+
+    def revoke_api_credential(
+        self, *, credential_id: str, tenant_id: str, replaced_by: str | None = None
+    ) -> bool:
+        """Revokes a key, but only one belonging to `tenant_id`.
+
+        The tenant predicate is inside the UPDATE, not checked before it. A
+        read-then-write would let a caller revoke another tenant's credential
+        if the check and the write ever drifted apart; here the database
+        refuses, and `rowcount == 0` is indistinguishable from "no such key",
+        which is also the right thing to tell a caller asking about somebody
+        else's credential.
+        """
+        with _WRITE_LOCK, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE api_credentials SET status = 'revoked', revoked_at = ?, replaced_by = ?"
+                " WHERE credential_id = ? AND status = 'active'"
+                "   AND (operator_id = ? OR merchant_id = ?)",
+                (utc_now(), replaced_by, credential_id, tenant_id, tenant_id),
+            )
+            return result.rowcount > 0
+
+    def list_api_credentials(self, *, tenant_id: str) -> list[dict]:
+        """Every credential for one tenant. Hashes are never returned."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT credential_id, operator_id, merchant_id, label, key_prefix, scopes,"
+                " status, created_at, last_used_at, revoked_at, replaced_by"
+                " FROM api_credentials WHERE operator_id = ? OR merchant_id = ?"
+                " ORDER BY created_at DESC",
+                (tenant_id, tenant_id),
+            ).fetchall()
+        return [
+            {
+                "credentialId": r["credential_id"],
+                "label": r["label"],
+                "keyPrefix": r["key_prefix"],
+                "scopes": (r["scopes"] or "").split(),
+                "status": r["status"],
+                "createdAt": r["created_at"],
+                "lastUsedAt": r["last_used_at"],
+                "revokedAt": r["revoked_at"],
+                "replacedBy": r["replaced_by"],
+            }
+            for r in rows
+        ]
+
+    # -- agent signing credentials ----------------------------------------
+
+    def create_enrollment_challenge(
+        self, *, challenge_id: str, operator_id: str, agent_id: str, nonce: str, ttl_seconds: int
+    ) -> dict:
+        """Issues a single-use nonce for proof-of-possession enrollment."""
+        now = datetime.now(UTC)
+        expires_at = (
+            (now + timedelta(seconds=ttl_seconds))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        created_at = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+        with _WRITE_LOCK, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO enrollment_challenges (challenge_id, operator_id, agent_id, nonce,"
+                " expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (challenge_id, operator_id, agent_id, nonce, expires_at, created_at),
+            )
+        return {
+            "challengeId": challenge_id,
+            "agentId": agent_id,
+            "nonce": nonce,
+            "expiresAt": expires_at,
+        }
+
+    def consume_enrollment_challenge(
+        self, *, challenge_id: str, operator_id: str
+    ) -> Mapping[str, Any] | None:
+        """Claims a challenge exactly once, atomically.
+
+        The conditional UPDATE is the whole mechanism, for the same reason it
+        is in `create_commitment`: a SELECT-then-UPDATE lets two concurrent
+        enrollments both observe an unconsumed challenge and both proceed. A
+        replayable challenge is not a challenge.
+
+        Returns the claimed row, or None if it was already used, expired, or
+        belongs to another operator.
+        """
+        with _WRITE_LOCK, self._connect() as conn:
+            claimed = conn.execute(
+                "UPDATE enrollment_challenges SET consumed_at = ?"
+                " WHERE challenge_id = ? AND operator_id = ?"
+                "   AND consumed_at IS NULL AND expires_at > ?",
+                (utc_now(), challenge_id, operator_id, utc_now()),
+            )
+            if claimed.rowcount == 0:
+                return None
+            return conn.execute(
+                "SELECT * FROM enrollment_challenges WHERE challenge_id = ?", (challenge_id,)
+            ).fetchone()
+
+    def enroll_agent_credential(
+        self,
+        *,
+        credential_id: str,
+        agent_id: str,
+        operator_id: str | None,
+        public_key: str,
+        algorithm: str,
+        valid_until: str | None = None,
+        rotate: bool = False,
+    ) -> dict:
+        """Binds a signing key to an agent, under an operator.
+
+        Two rows move together and must not diverge: `agents` carries the
+        currently-active key (read on the hot path of every paid request) and
+        `agent_credentials` carries the full lifecycle. Both are written in
+        one transaction.
+
+        `rotate=True` supersedes the current credential and installs the new
+        one. Without it, binding a *different* key to an existing agent is
+        refused — which is what keeps key rotation and account takeover from
+        being the same request. Re-enrolling the identical key is a no-op, so
+        an agent that restarts and re-announces itself does not have to know
+        whether it has enrolled before.
+
+        Raises:
+            ValueError: On a rebinding attempt without `rotate`, or when the
+                agent belongs to a different operator.
+        """
+        now = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
+            ).fetchone()
+
+            if existing is not None:
+                # An agent already claimed by another operator is never
+                # re-bindable. Without this, enrolling a key for someone
+                # else's agent id would be a takeover with extra steps.
+                current_operator = existing["operator_id"]
+                if (
+                    current_operator is not None
+                    and operator_id is not None
+                    and current_operator != operator_id
+                ):
+                    raise ValueError(
+                        f"agent {agent_id} belongs to operator {current_operator}"
+                    )
+
+                if existing["public_key"] == public_key and not rotate:
+                    return {
+                        "agentId": agent_id,
+                        "credentialId": credential_id,
+                        "publicKey": public_key,
+                        "algorithm": existing["algorithm"],
+                        "operatorId": current_operator or operator_id,
+                        "created": False,
+                        "rotated": False,
+                    }
+
+                if not rotate:
+                    raise ValueError(
+                        f"agent {agent_id} is already registered with a different public key"
+                    )
+
+                # Supersede — never delete. A revoked or replaced credential
+                # has to stay readable, or acceptances it signed stop being
+                # verifiable and the audit trail loses exactly the evidence
+                # that made Ed25519 worth using.
+                conn.execute(
+                    "UPDATE agent_credentials SET status = 'superseded', replaced_by = ?"
+                    " WHERE agent_id = ? AND status = 'active'",
+                    (credential_id, agent_id),
+                )
+                conn.execute(
+                    "UPDATE agents SET public_key = ?, algorithm = ?, operator_id ="
+                    " COALESCE(operator_id, ?) WHERE agent_id = ?",
+                    (public_key, algorithm, operator_id, agent_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO agents (agent_id, public_key, algorithm, registered_at,"
+                    " operator_id, status) VALUES (?, ?, ?, ?, ?, 'active')",
+                    (agent_id, public_key, algorithm, now, operator_id),
+                )
+
+            conn.execute(
+                "INSERT INTO agent_credentials (credential_id, agent_id, algorithm, public_key,"
+                " status, valid_from, valid_until, created_at)"
+                " VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
+                (credential_id, agent_id, algorithm, public_key, now, valid_until, now),
+            )
+
+        return {
+            "agentId": agent_id,
+            "credentialId": credential_id,
+            "publicKey": public_key,
+            "algorithm": algorithm,
+            "operatorId": operator_id,
+            "validUntil": valid_until,
+            "created": existing is None,
+            "rotated": existing is not None,
+        }
+
+    def get_active_agent_credential(self, agent_id: str) -> Mapping[str, Any] | None:
+        """The agent's currently-usable signing key, or None.
+
+        Validity is evaluated in SQL — status active, and inside its window.
+        An expired or revoked credential is simply not returned, so a caller
+        that forgets to check cannot accidentally authorize against one.
+        """
+        now = utc_now()
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM agent_credentials"
+                " WHERE agent_id = ? AND status = 'active'"
+                "   AND valid_from <= ?"
+                "   AND (valid_until IS NULL OR valid_until > ?)"
+                " ORDER BY created_at DESC",
+                (agent_id, now, now),
+            ).fetchone()
+
+    def list_agent_credentials(self, agent_id: str) -> list[dict]:
+        """Full credential history for an agent, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_credentials WHERE agent_id = ? ORDER BY created_at DESC",
+                (agent_id,),
+            ).fetchall()
+        return [
+            {
+                "credentialId": r["credential_id"],
+                "algorithm": r["algorithm"],
+                "publicKey": r["public_key"],
+                "status": r["status"],
+                "validFrom": r["valid_from"],
+                "validUntil": r["valid_until"],
+                "revokedAt": r["revoked_at"],
+                "replacedBy": r["replaced_by"],
+            }
+            for r in rows
+        ]
+
+    def revoke_agent_credential(self, *, credential_id: str, agent_id: str) -> bool:
+        """Revokes one signing credential.
+
+        Revocation stops *new* authorization. It does not rewrite history: the
+        row stays, so a signature produced while the key was valid remains
+        verifiable against it. If the revoked credential was the active one,
+        `agents.public_key` is left in place but
+        `get_active_agent_credential` will now return None — which is what
+        actually gates authorization.
+        """
+        with _WRITE_LOCK, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE agent_credentials SET status = 'revoked', revoked_at = ?"
+                " WHERE credential_id = ? AND agent_id = ? AND status != 'revoked'",
+                (utc_now(), credential_id, agent_id),
+            )
+            return result.rowcount > 0
+
+    def set_agent_status(self, *, agent_id: str, status: str, operator_id: str) -> bool:
+        """Suspends or resumes an agent, scoped to its owning operator."""
+        with _WRITE_LOCK, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE agents SET status = ? WHERE agent_id = ? AND operator_id = ?",
+                (status, agent_id, operator_id),
+            )
+            return result.rowcount > 0
+
+    def list_agents_for_operator(self, operator_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT agent_id, status, registered_at, algorithm FROM agents"
+                " WHERE operator_id = ? ORDER BY registered_at DESC",
+                (operator_id,),
+            ).fetchall()
+        return [
+            {
+                "agentId": r["agent_id"],
+                "status": r["status"],
+                "registeredAt": r["registered_at"],
+                "algorithm": r["algorithm"],
+            }
+            for r in rows
+        ]
+
+    # -- spending consents -------------------------------------------------
+
+    def create_consent(
+        self,
+        *,
+        consent_id: str,
+        operator_id: str,
+        agent_id: str,
+        per_request_limit_paise: int,
+        daily_limit_paise: int,
+        total_limit_paise: int,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
+        merchant_ids: list[str] | None = None,
+        currency: str = "INR",
+    ) -> dict:
+        """Records an operator's authorisation for an agent to spend.
+
+        Limits are integer paise. A limit of 0 means "no limit configured for
+        this dimension", which is why every caller checks `> 0` before
+        enforcing — 0 as "spend nothing" would make an unset field silently
+        deny everything.
+        """
+        now = utc_now()
+        with _WRITE_LOCK, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO spending_consents (consent_id, operator_id, agent_id, status,"
+                " currency, per_request_limit_paise, daily_limit_paise, total_limit_paise,"
+                " reserved_paise, consumed_paise, valid_from, valid_until, created_at)"
+                " VALUES (?, ?, ?, 'active', ?, ?, ?, ?, 0, 0, ?, ?, ?)",
+                (
+                    consent_id,
+                    operator_id,
+                    agent_id,
+                    currency,
+                    int(per_request_limit_paise),
+                    int(daily_limit_paise),
+                    int(total_limit_paise),
+                    valid_from or now,
+                    valid_until,
+                    now,
+                ),
+            )
+            for merchant_id in merchant_ids or []:
+                conn.execute(
+                    "INSERT INTO consent_publishers (consent_id, merchant_id) VALUES (?, ?)"
+                    " ON CONFLICT (consent_id, merchant_id) DO NOTHING",
+                    (consent_id, merchant_id),
+                )
+
+        return {
+            "consentId": consent_id,
+            "operatorId": operator_id,
+            "agentId": agent_id,
+            "status": "active",
+            "currency": currency,
+            "perRequestLimitPaise": int(per_request_limit_paise),
+            "dailyLimitPaise": int(daily_limit_paise),
+            "totalLimitPaise": int(total_limit_paise),
+            "reservedPaise": 0,
+            "consumedPaise": 0,
+            "validFrom": valid_from or now,
+            "validUntil": valid_until,
+            "merchantIds": sorted(merchant_ids or []),
+            "createdAt": now,
+        }
+
+    def get_consent(self, consent_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM spending_consents WHERE consent_id = ?", (consent_id,)
+            ).fetchone()
+
+    def active_consent_for_agent(self, agent_id: str) -> Mapping[str, Any] | None:
+        """The consent an agent's spend should be authorised against.
+
+        Validity is filtered in SQL for the same reason as agent credentials:
+        an expired consent should not be *returned* and then hopefully
+        rejected downstream. Newest first, so re-consenting supersedes in
+        practice without needing an explicit swap.
+        """
+        now = utc_now()
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM spending_consents"
+                " WHERE agent_id = ? AND status = 'active'"
+                "   AND valid_from <= ?"
+                "   AND (valid_until IS NULL OR valid_until > ?)"
+                " ORDER BY created_at DESC",
+                (agent_id, now, now),
+            ).fetchone()
+
+    def consent_merchant_scope(self, consent_id: str) -> frozenset[str]:
+        """Merchants a consent is restricted to. Empty means unrestricted."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT merchant_id FROM consent_publishers WHERE consent_id = ?", (consent_id,)
+            ).fetchall()
+        return frozenset(r["merchant_id"] for r in rows)
+
+    def set_consent_status(self, *, consent_id: str, operator_id: str, status: str) -> bool:
+        """Suspends, resumes, or revokes a consent.
+
+        Scoped to the owning operator inside the UPDATE — one operator must
+        not be able to revoke another's authorisation, and the predicate being
+        in the write rather than a preceding read is what guarantees it.
+
+        Revocation is terminal: a revoked consent cannot be resumed, because
+        "resume" on a withdrawn authorisation is a new authorisation and
+        should be an explicit new consent with its own audit row.
+        """
+        revoked_at = utc_now() if status == "revoked" else None
+        with _WRITE_LOCK, self._connect() as conn:
+            result = conn.execute(
+                "UPDATE spending_consents SET status = ?,"
+                " revoked_at = COALESCE(?, revoked_at)"
+                " WHERE consent_id = ? AND operator_id = ? AND status != 'revoked'",
+                (status, revoked_at, consent_id, operator_id),
+            )
+            return result.rowcount > 0
+
+    def list_consents(self, *, operator_id: str, agent_id: str | None = None) -> list[dict]:
+        """Consents belonging to one operator, optionally narrowed to an agent."""
+        sql = "SELECT * FROM spending_consents WHERE operator_id = ?"
+        params: list[Any] = [operator_id]
+        if agent_id:
+            sql += " AND agent_id = ?"
+            params.append(agent_id)
+        sql += " ORDER BY created_at DESC"
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [
+            {
+                "consentId": r["consent_id"],
+                "operatorId": r["operator_id"],
+                "agentId": r["agent_id"],
+                "status": r["status"],
+                "currency": r["currency"],
+                "perRequestLimitPaise": r["per_request_limit_paise"],
+                "dailyLimitPaise": r["daily_limit_paise"],
+                "totalLimitPaise": r["total_limit_paise"],
+                "reservedPaise": r["reserved_paise"],
+                "consumedPaise": r["consumed_paise"],
+                "validFrom": r["valid_from"],
+                "validUntil": r["valid_until"],
+                "revokedAt": r["revoked_at"],
+                "createdAt": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    def committed_against_consent(self, *, consent_id: str, settle_date: str) -> int:
+        """What has already been committed under one consent, on one date.
+
+        The daily-limit input. Scoped to the consent rather than the agent so
+        that re-consenting starts a fresh daily window, which is the behaviour
+        an operator issuing a new authorisation would expect.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT CAST(COALESCE(SUM(amount_paise), 0) AS BIGINT) AS total"
+                " FROM commitments WHERE consent_id = ? AND settle_date = ?"
+                "   AND status != 'failed'",
+                (consent_id, settle_date),
+            ).fetchone()
+        return int(row["total"]) if row else 0
 
     # -- offers ------------------------------------------------------------
 
@@ -677,6 +1501,8 @@ class Ledger:
         mode: str,
         settle_date: str | None = None,
         daily_cap_paise: int = UNLIMITED_PAISE,
+        operator_id: str | None = None,
+        consent_id: str | None = None,
     ) -> dict:
         """Turns an open offer into a commitment, atomically.
 
@@ -754,8 +1580,9 @@ class Ledger:
                 # having it burned by hitting a limit.
                 inserted = conn.execute(
                     "INSERT INTO commitments (commitment_id, offer_id, agent_id, resource_id,"
-                    " amount_paise, asset, created_at, settle_date, mode, status)"
-                    " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'"
+                    " amount_paise, asset, created_at, settle_date, mode, status,"
+                    " operator_id, consent_id)"
+                    " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?"
                     " WHERE COALESCE((SELECT SUM(amount_paise) FROM commitments"
                     "                 WHERE agent_id = ? AND settle_date = ?), 0) + ? <= ?",
                     (
@@ -768,6 +1595,8 @@ class Ledger:
                         created_at,
                         settle_date,
                         mode,
+                        operator_id,
+                        consent_id,
                         agent_id,
                         settle_date,
                         int(amount_paise),
@@ -802,6 +1631,11 @@ class Ledger:
             "settleDate": settle_date,
             "mode": mode,
             "status": "pending",
+            # Null means nobody is on the hook for this receivable but a
+            # pseudonymous key — the state the unsafe demo path produces, and
+            # worth being able to see rather than inferring from an absence.
+            "operatorId": operator_id,
+            "consentId": consent_id,
         }
 
     def pending_commitments(

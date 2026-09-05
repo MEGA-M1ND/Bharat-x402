@@ -42,11 +42,19 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import consent
+from consent import ConsentDenied
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from identity import (
+    SCOPE_ECONOMICS_READ,
+    SCOPE_EVENTS_READ,
+    SCOPE_LEDGER_READ,
+    SCOPE_SETTLE_WRITE,
+)
 from ledger import DailyCapExceeded, Ledger, redact_credentials, today_utc
 from limits import LimitExceeded, SpendPolicy
 from payment_verifier import (
@@ -115,15 +123,68 @@ AUTHORITY_REQUIRED = os.getenv("AUTHORITY_REQUIRED", "false").strip().lower() in
     "yes",
 )
 
+
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
+
+
+# Whether the *public dashboard reads* — /ledger/summary, /economics,
+# /ledger/events — may be called without an API key.
+#
+# DEFAULT IS CLOSED. This is the single most consequential default in the
+# service: before Phase 2 these endpoints were unconditionally public and
+# returned any named agent's spend, any publisher's revenue, and the entire
+# audit trail to anyone who asked. An `agentId` query parameter is a filter,
+# and a filter is not authorization.
+#
+# The hosted demo turns this on deliberately, because a browser cannot hold a
+# secret and the whole point of that deployment is that a stranger can click
+# it. That is a real trade, made once, in one place, with a startup warning —
+# not a permissive default that nobody notices. Writes are never opened by it:
+# /settle-batch and the entire /control plane always require a key.
+DEMO_OPEN_DASHBOARD = _flag("DEMO_OPEN_DASHBOARD", "false")
+
+# Whether an unauthenticated caller may still bind a public key to an agent id
+# by being first (`POST /agents/register`).
+#
+# DEFAULT IS CLOSED. Trust-on-first-use proves key continuity, not identity,
+# and "first caller wins" is an identity-claiming vulnerability the moment an
+# agent id is worth anything. Enrollment now runs through an authenticated
+# operator and a challenge-response proof of possession — see
+# control_plane.enroll_agent.
+DEMO_UNSAFE_TOFU = _flag("DEMO_UNSAFE_TOFU", "false")
+
+# Whether an agent must hold an active operator consent to spend at all.
+#
+# DEFAULT IS ON. This is the Phase 2 thesis in one flag: x402 establishes that
+# an agent agreed to a price, and that is not the same as being allowed to
+# spend somebody's money. With this on, an agent with no consent is refused at
+# quote time — before it signs anything and before a ledger row exists.
+#
+# Off, the facilitator books commitments against pseudonymous keys with nobody
+# on the hook for them, which is what the original design did.
+REQUIRE_CONSENT = _flag("REQUIRE_CONSENT", "true")
+
+# The publisher these quotes are for, when the deployment serves one. Consents
+# can be scoped to named merchants; with no merchant identified, a consent
+# that names any merchant will refuse rather than assume this is one of them.
+FACILITATOR_MERCHANT_ID = (os.getenv("FACILITATOR_MERCHANT_ID") or "").strip() or None
+
 HMAC_SECRET = os.getenv("FACILITATOR_HMAC_SECRET", "dev-only-shared-secret-change-me")
 
 # Whether an agent with no registered Ed25519 key may still pay with a
-# shared-secret HMAC proof. True by default so existing clients — the CLI
-# agent's older invocations, anything written against the previous protocol —
-# keep working while keys roll out. Set false to require registration, which
-# is the end state: see payment_verifier.py on why a shared secret cannot
-# provide non-repudiation no matter how strong the MAC is.
-ALLOW_HMAC_FALLBACK = os.getenv("ALLOW_HMAC_FALLBACK", "true").strip().lower() in (
+# shared-secret HMAC proof.
+#
+# DEFAULT IS NOW FALSE. This was `true` while Ed25519 keys were rolling out —
+# a migration ramp so existing clients kept working. A ramp that never ends is
+# just a permanently weaker default, and a shared secret cannot provide
+# non-repudiation no matter how strong the MAC is: the facilitator holds the
+# same key the agent does, so it could mint any agent's acceptance itself. See
+# payment_verifier.py.
+#
+# The demo profile may still set it true; the production-like default requires
+# a registered key.
+ALLOW_HMAC_FALLBACK = os.getenv("ALLOW_HMAC_FALLBACK", "false").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -227,6 +288,14 @@ import webhooks  # noqa: E402 - imported here, after `ledger` exists to configur
 
 webhooks.configure(ledger=ledger, webhook_secret=RAZORPAY_WEBHOOK_SECRET)
 app.include_router(webhooks.router)
+
+import control_plane  # noqa: E402 - same reason: needs `ledger` on app.state first
+
+# The control plane reaches the ledger through app state rather than importing
+# it from here, which keeps it importable on its own and lets the tests mount
+# it against a throwaway database.
+app.state.ledger = ledger
+app.include_router(control_plane.router)
 
 if ENABLE_DEMO_API:
     import demo_trace
@@ -332,6 +401,43 @@ if FACILITATOR_STARTUP_CHECK:
             scheme=X402_SCHEME,
             offerTtlSeconds=OFFER_POLICY.ttl_seconds,
         )
+
+        # Every relaxed security default, named, at startup.
+        #
+        # A permissive setting that nobody notices is the whole failure mode
+        # these flags exist to avoid, and the one that had actually happened
+        # here: the HMAC fallback shipped as a migration ramp and was still on
+        # long after the migration finished, because nothing ever said so. A
+        # deployment that is running open now has to say it out loud, once per
+        # boot, in the same structured log everything else goes to.
+        relaxed = {
+            "DEMO_OPEN_DASHBOARD": DEMO_OPEN_DASHBOARD,
+            "DEMO_UNSAFE_TOFU": DEMO_UNSAFE_TOFU,
+            "ALLOW_HMAC_FALLBACK": ALLOW_HMAC_FALLBACK,
+            "REQUIRE_CONSENT_DISABLED": not REQUIRE_CONSENT,
+        }
+        enabled = sorted(name for name, on in relaxed.items() if on)
+        if enabled:
+            ledger.log_event(
+                "insecure_demo_mode_enabled",
+                status="warning",
+                flags=" ".join(enabled),
+                message=(
+                    "Running with relaxed defaults for the public demo. Each of these is "
+                    "closed in the production-like profile; see docs/threat-model.md."
+                ),
+            )
+        else:
+            ledger.log_event(
+                "security_profile",
+                status="ok",
+                profile="production-like",
+                message=(
+                    "Dashboard reads require an API key, key enrollment requires an "
+                    "authenticated operator, HMAC fallback is off, and an operator "
+                    "consent is required to spend."
+                ),
+            )
 
         # Find out now whether settlement will actually work, rather than at
         # the end of the first day with a ledger full of commitments behind it.
@@ -489,10 +595,20 @@ def _agent_key_for(offer_row: Any | None) -> Any | None:
     unregistered id, find no key on file, and be dropped onto the HMAC
     fallback path. Reading the id from our own record means the choice of
     which key must verify is not something the caller can influence.
+
+    Reads `agent_credentials`, not `agents`. The credential table is where
+    status and validity live, and `get_active_agent_credential` filters on
+    both in SQL — so a revoked or expired key is simply not returned, and a
+    payment presented under it fails as `agent_not_registered` rather than
+    being cheerfully verified against a key an operator has withdrawn.
+
+    Returning None here is what makes revocation *bite*: it drops the caller
+    onto the "no key on file" branch, which under the production default
+    (`ALLOW_HMAC_FALLBACK=false`) is a refusal.
     """
     if offer_row is None:
         return None
-    return ledger.get_agent(offer_row["agent_id"])
+    return ledger.get_active_agent_credential(offer_row["agent_id"])
 
 
 @app.post("/agents/register")
@@ -520,6 +636,32 @@ def register_agent(request: AgentRegistration) -> JSONResponse:
             content={
                 "error": "unsupported_algorithm",
                 "message": f"This facilitator verifies {ALGORITHM} signatures only.",
+            },
+        )
+
+    # Trust-on-first-use, gated.
+    #
+    # This endpoint binds a public key to an agent id on the strength of
+    # nothing but arriving first. That was defensible when an agent id was
+    # worth nothing; it stops being defensible the moment an id carries a
+    # spending consent, because claiming the id is then claiming the money.
+    #
+    # The replacement is POST /control/agents/enroll: an authenticated
+    # operator, a server-issued nonce, and a signature proving possession of
+    # the private half. This path survives only for the public demo, where
+    # there is no operator to authenticate as.
+    if not DEMO_UNSAFE_TOFU:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "tofu_disabled",
+                "message": (
+                    "Unauthenticated key registration is disabled. Enroll through "
+                    "POST /control/agents/challenge then POST /control/agents/enroll "
+                    "with an operator API key, which proves possession of the private "
+                    "key instead of trusting whoever asks first."
+                ),
+                "enrollmentEndpoint": "/control/agents/enroll",
             },
         )
 
@@ -679,6 +821,80 @@ def verify(request: X402Request) -> JSONResponse:
     )
 
 
+def _authorize_spend(*, agent_id: str, amount_paise: int) -> tuple[str | None, str | None]:
+    """Decides whether this agent may incur this expense at all.
+
+    The question x402 does not ask. A signed acceptance proves a key agreed to
+    a price; it says nothing about whether that key was ever authorised to
+    spend anyone's money. This is where an operator's consent — with its
+    per-request, daily, and lifetime limits, its publisher scope, and its
+    revocability — is actually enforced.
+
+    Called at BOTH `/offer` and `/settle`, deliberately. Quote time is where a
+    refusal is most useful (the agent finds out before it signs, and no row is
+    written); settle time is where it is *binding*, because the two are
+    separate HTTP requests and a consent can be revoked between them.
+
+    Args:
+        agent_id: The agent proposing to spend.
+        amount_paise: The quoted amount, integer paise.
+
+    Returns:
+        `(operator_id, consent_id)` to stamp on the commitment, or
+        `(None, None)` when consent is not required and none exists — the
+        legacy path, where nobody is on the hook but a pseudonymous key.
+
+    Raises:
+        ConsentDenied: On any refusal. Never falls through to allowed.
+    """
+    consent_row = ledger.active_consent_for_agent(agent_id)
+
+    if consent_row is None:
+        if not REQUIRE_CONSENT:
+            return None, None
+        raise ConsentDenied(
+            "no_consent",
+            f"agent {agent_id} has no active spending consent. An operator must authorise "
+            "it via POST /control/consents before it can incur an expense.",
+        )
+
+    decision = consent.evaluate(
+        consent=consent_row,
+        operator=ledger.get_operator(consent_row["operator_id"]),
+        agent=ledger.get_agent(agent_id),
+        merchant_id=FACILITATOR_MERCHANT_ID,
+        scoped_merchant_ids=ledger.consent_merchant_scope(consent_row["consent_id"]),
+        amount_paise=amount_paise,
+        committed_today_paise=ledger.committed_against_consent(
+            consent_id=consent_row["consent_id"], settle_date=today_utc()
+        ),
+    )
+    return decision.operator_id, decision.consent_id
+
+
+def _consent_refusal(exc: ConsentDenied, *, agent_id: str, amount_paise: int) -> JSONResponse:
+    """Records and renders a consent refusal in the x402 failure shape."""
+    ledger.log_event(
+        "spend_refused_by_consent",
+        agent_id=agent_id,
+        amount_paise=amount_paise,
+        status="rejected",
+        reason=exc.reason,
+        message=exc.message,
+        **exc.detail,
+    )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": False,
+            "errorReason": exc.reason,
+            "errorMessage": exc.message,
+            "transaction": "",
+            "network": X402_NETWORK,
+        },
+    )
+
+
 def _deferred_extension(
     *,
     commitment_id: str,
@@ -811,6 +1027,19 @@ def settle(request: X402Request) -> JSONResponse:
             },
         )
 
+    # The binding consent check. /offer already refused the obvious cases, but
+    # that was a different HTTP request: a consent can be suspended, revoked,
+    # or exhausted between the quote and its use, and the answer that counts
+    # is the one at the moment the receivable is booked.
+    try:
+        operator_id, consent_id = _authorize_spend(
+            agent_id=result["agentId"], amount_paise=result["amountPaise"]
+        )
+    except ConsentDenied as exc:
+        return _consent_refusal(
+            exc, agent_id=result["agentId"], amount_paise=result["amountPaise"]
+        )
+
     commitment_id = f"cmt_{uuid.uuid4().hex[:20]}"
 
     try:
@@ -823,6 +1052,8 @@ def settle(request: X402Request) -> JSONResponse:
             asset=result["asset"],
             mode=SETTLEMENT_MODE,
             daily_cap_paise=SPEND_POLICY.cap_for_sql,
+            operator_id=operator_id,
+            consent_id=consent_id,
         )
     except DailyCapExceeded as exc:
         # The binding check, and the one that holds under concurrency — the
@@ -1036,6 +1267,31 @@ def offer(request: OfferRequest) -> JSONResponse:
             },
         )
 
+    # Operator consent, before anything is written.
+    #
+    # Quote time is where a refusal is most useful — the agent learns its
+    # authority is missing or exhausted before it signs, and no ledger row is
+    # created. It is re-checked at /settle, which is where the decision
+    # actually binds: the two are separate HTTP requests and consent can be
+    # revoked in between.
+    try:
+        _authorize_spend(agent_id=request.agentId, amount_paise=request.amountPaise)
+    except ConsentDenied as exc:
+        ledger.log_event(
+            "offer_refused_by_consent",
+            agent_id=request.agentId,
+            resource_id=request.resourceId,
+            amount_paise=request.amountPaise,
+            status="rejected",
+            reason=exc.reason,
+            message=exc.message,
+            **exc.detail,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={"error": exc.reason, "message": exc.message, **exc.detail},
+        )
+
     # Spending controls, before anything is written. Refusing at quote time is
     # the useful place: the agent finds out before it signs, and a refused
     # quote costs the facilitator one row it does not create.
@@ -1121,7 +1377,7 @@ def offer(request: OfferRequest) -> JSONResponse:
 
 
 @app.post("/settle-batch")
-def settle_batch(request: BatchRequest) -> JSONResponse:
+def settle_batch(request: BatchRequest, http_request: Request) -> JSONResponse:
     """Collapse outstanding commitments into one Razorpay Payment Link per agent.
 
     This is the endpoint the whole project exists to demonstrate. A few hundred
@@ -1138,6 +1394,21 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
     Returns:
         Per-agent batch results plus the settlement cost comparison.
     """
+    # Settlement is a WRITE that creates real gateway charges against real
+    # commitments, so unlike the dashboard reads it is never opened by the demo
+    # profile. `settle:write` is required whenever a control plane is
+    # reachable; the demo deployment reaches it through the session-scoped
+    # agentId path below, which cannot sweep anyone else's commitments.
+    authorization = http_request.headers.get("authorization")
+    if authorization or not DEMO_OPEN_DASHBOARD:
+        try:
+            principal = control_plane.authenticate(ledger, authorization)
+            principal.require(SCOPE_SETTLE_WRITE)
+            if principal.operator_id:
+                request.agentId = _tenant_agent_filter(principal, request.agentId)
+        except control_plane.AuthError as exc:
+            return control_plane.auth_error_response(exc)
+
     if not request.agentId and not ALLOW_GLOBAL_SETTLE:
         return JSONResponse(
             status_code=400,
@@ -1338,15 +1609,108 @@ def settle_batch(request: BatchRequest) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/ledger/summary")
-def ledger_summary(settleDate: str | None = None, agentId: str | None = None) -> dict:
-    """One day's activity, for the reporting script and for eyeballing a demo.
+def _authorize_read(authorization: str | None, scope: str) -> control_plane.Principal | None:
+    """Gates a dashboard read.
 
-    `agentId` narrows to one agent's traffic — what the console's dashboard
-    uses so one visitor's session does not show, or via `/settle-batch`,
-    settle, everyone else's pending commitments too.
+    Returns the authenticated principal, or None when the demo profile has
+    opened these reads and no credential was presented.
+
+    The shape matters: `None` means "unauthenticated, and that is permitted
+    here", which the caller must handle by scoping the read some other way. It
+    never means "treat as authorized". A caller that ignores the return value
+    still gets the exception on the closed path.
+
+    Raises:
+        AuthError: When authentication is required and absent or invalid, or
+            when the presented key lacks `scope`.
     """
-    return ledger.daily_summary(settleDate, agent_id=agentId)
+    if DEMO_OPEN_DASHBOARD and not authorization:
+        return None
+    principal = control_plane.authenticate(ledger, authorization)
+    principal.require(scope)
+    return principal
+
+
+def _tenant_agent_filter(
+    principal: control_plane.Principal | None, requested_agent_id: str | None
+) -> str | None:
+    """Resolves which agent's data a caller may actually see.
+
+    The rule that closes the cross-tenant hole: **an operator key can only
+    ever read its own agents.** A requested `agentId` may narrow that, never
+    widen it — so `?agentId=someone-elses-agent` on an operator key resolves
+    to that operator's own scope and returns nothing belonging to the other
+    party, rather than being honoured.
+
+    Merchant keys read publisher-side aggregates and are not agent-scoped, so
+    for them the requested filter is passed through unchanged.
+
+    Args:
+        principal: The authenticated caller, or None under the open demo
+            profile.
+        requested_agent_id: The `agentId` query parameter, if any.
+
+    Returns:
+        The agent id to filter on, or None for an unfiltered read.
+
+    Raises:
+        AuthError: If an operator key asks for an agent it does not own.
+    """
+    if principal is None:
+        # Demo profile: the console partitions by session-derived agent id.
+        # This is not authorization and is not presented as any.
+        return requested_agent_id
+
+    if principal.merchant_id:
+        return requested_agent_id
+
+    operator_id = principal.operator_id
+    owned = {a["agentId"] for a in ledger.list_agents_for_operator(operator_id)}
+
+    if requested_agent_id is None:
+        # No filter asked for. An operator with exactly one agent gets it;
+        # with several, `None` would read *everyone's* data, so refuse rather
+        # than guess.
+        if len(owned) == 1:
+            return next(iter(owned))
+        raise control_plane.AuthError(
+            "agent_id_required",
+            "This operator has "
+            f"{len(owned)} agents. Name one with ?agentId= — an unfiltered read would "
+            "cross tenants.",
+            400,
+        )
+
+    if requested_agent_id not in owned:
+        raise control_plane.AuthError(
+            "not_your_agent",
+            f"agent {requested_agent_id} does not belong to this operator",
+            403,
+        )
+    return requested_agent_id
+
+
+@app.get("/ledger/summary")
+def ledger_summary(
+    request: Request,
+    settleDate: str | None = None,
+    agentId: str | None = None,
+) -> JSONResponse:
+    """One day's activity, for the reporting script and the dashboard.
+
+    Requires `ledger:read` unless the demo profile has opened dashboard reads.
+    The agent filter is resolved from the *key*, not from the query string —
+    see `_tenant_agent_filter` for why that distinction is the whole fix.
+    """
+    try:
+        principal = _authorize_read(request.headers.get("authorization"), SCOPE_LEDGER_READ)
+        agent_filter = _tenant_agent_filter(principal, agentId)
+    except control_plane.AuthError as exc:
+        return control_plane.auth_error_response(exc)
+
+    return JSONResponse(
+        status_code=200, content=ledger.daily_summary(settleDate, agent_id=agent_filter)
+    )
 
 
 @app.get("/agents/{agent_id}/limits")
@@ -1376,17 +1740,28 @@ def agent_limits(agent_id: str, settleDate: str | None = None) -> dict:
 
 
 @app.get("/economics")
-def economics(settleDate: str | None = None, agentId: str | None = None) -> dict:
+def economics(
+    request: Request, settleDate: str | None = None, agentId: str | None = None
+) -> JSONResponse:
     """The batching-versus-per-request comparison, as a read.
 
     `/settle-batch` computes the same figures but only ever sees commitments
     still `pending` — so a card built the same way would go blank the instant
     a batch clears. This looks at every commitment for the day regardless of
     status, so the number stays put after settling.
+
+    Requires `economics:read` unless the demo profile has opened dashboard
+    reads.
     """
+    try:
+        principal = _authorize_read(request.headers.get("authorization"), SCOPE_ECONOMICS_READ)
+        agentId = _tenant_agent_filter(principal, agentId)
+    except control_plane.AuthError as exc:
+        return control_plane.auth_error_response(exc)
+
     settle_date = settleDate or today_utc()
     amounts = ledger.commitment_amounts(agent_id=agentId, settle_date=settle_date)
-    return {
+    return JSONResponse(status_code=200, content={
         "settleDate": settle_date,
         "agentId": agentId,
         "economics": estimate_settlement_cost(amounts, fee_model) if amounts else None,
@@ -1397,21 +1772,38 @@ def economics(settleDate: str | None = None, agentId: str | None = None) -> dict
             agent_id=agentId, settle_date=settle_date
         ),
         "gatewayMinimumPaise": fee_model.minimum_charge_paise,
-    }
+    })
 
 
 @app.get("/ledger/events")
 def ledger_events(
-    agentId: str | None = None, limit: int = 50, sinceId: int | None = None
-) -> dict:
+    request: Request,
+    agentId: str | None = None,
+    limit: int = 50,
+    sinceId: int | None = None,
+) -> JSONResponse:
     """The audit trail as a live feed — every event `log_event` has recorded.
 
     `sinceId` lets a poller ask for what's new since the last call rather
     than re-fetching the whole window; pass back the response's own
     `nextSinceId` on the following call.
+
+    Requires `events:read` unless the demo profile has opened dashboard reads.
+    This is the most sensitive of the three: the audit trail carries every
+    agent's activity, so an unscoped read of it is a full disclosure of who is
+    buying what from whom.
     """
+    try:
+        principal = _authorize_read(request.headers.get("authorization"), SCOPE_EVENTS_READ)
+        agentId = _tenant_agent_filter(principal, agentId)
+    except control_plane.AuthError as exc:
+        return control_plane.auth_error_response(exc)
+
     events = ledger.list_events(agent_id=agentId, limit=limit, since_id=sinceId)
-    return {"events": events, "nextSinceId": events[0]["id"] if events else sinceId}
+    return JSONResponse(
+        status_code=200,
+        content={"events": events, "nextSinceId": events[0]["id"] if events else sinceId},
+    )
 
 
 @app.get("/health")

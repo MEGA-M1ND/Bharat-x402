@@ -235,16 +235,26 @@ class TestDbShim:
         which a literal count would flag every time the schema legitimately
         gains a table, training everyone to update the number without
         looking at what actually broke.
+
+        The count is of statement-*starting* CREATEs, anchored to the start of
+        a line. Counting every occurrence in the source was subtly wrong: a
+        comment explaining that "Postgres resolves foreign keys at CREATE
+        TABLE time" is prose, not DDL, and inflated the expected count by one
+        — failing the test for a documentation change while the splitter was
+        working perfectly. Anchoring matches what the test says it checks.
         """
+        import re
+
         from db import _split_sql_statements
         from ledger import schema_sql
 
         schema = schema_sql("postgres")
         statements = _split_sql_statements(schema)
 
-        assert len(statements) == schema.upper().count("CREATE TABLE") + schema.upper().count(
-            "CREATE INDEX"
+        expected = len(
+            re.findall(r"^\s*CREATE\s+(?:TABLE|INDEX)\b", schema, re.IGNORECASE | re.MULTILINE)
         )
+        assert len(statements) == expected
         for statement in statements:
             assert statement.upper().startswith(("CREATE TABLE", "CREATE INDEX")), statement
 

@@ -160,10 +160,26 @@ jobs:
 
       # ENABLE_DEMO_API turns on the console's server-side agent runner
       # (facilitator/demo_trace.py), exercised by the integration tests below.
+      #
+      # The four DEMO_* / REQUIRE_CONSENT values reproduce the *demo* security
+      # profile, which is what the hosted deployment runs and what the demo
+      # agent and console expect: open dashboard reads, trust-on-first-use key
+      # registration, and no operator consent required.
+      #
+      # The production-like closed profile is not skipped by doing this — it is
+      # covered by tests/test_control_plane.py and
+      # tests/test_operators_and_consent.py, which clear these variables via
+      # the `secure_defaults` marker and assert endpoint by endpoint that an
+      # unauthenticated or cross-tenant caller is refused. Those run in the
+      # `python` and `postgres` jobs above.
       - name: Start facilitator
         env:
           ENABLE_DEMO_API: "1"
           RESOURCE_URL: "http://localhost:3402"
+          DEMO_OPEN_DASHBOARD: "true"
+          DEMO_UNSAFE_TOFU: "true"
+          REQUIRE_CONSENT: "false"
+          ALLOW_HMAC_FALLBACK: "true"
         run: |
           cd facilitator
           nohup python -m uvicorn main:app --port 8402 > /tmp/facilitator.log 2>&1 &

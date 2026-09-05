@@ -80,10 +80,82 @@ def _reset_postgres_ledger(dsn: str) -> None:
         # leaving either populated between tests makes a second run of the
         # same test fail on a conflict that has nothing to do with the code
         # under test. The SQLite path gets this free by using a fresh file.
+        # Every table, including the Phase 2 identity and consent ones. A
+        # missing name here does not fail loudly — it leaks rows into the next
+        # test, which shows up much later as an order-dependent failure on
+        # Postgres only. `operators` and `merchants` are especially easy to
+        # forget and especially annoying: a leftover operator makes a
+        # "create then read back" test pass for the wrong reason.
         conn.execute(
-            "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events"
+            "TRUNCATE TABLE agents, offers, batches, commitments, events, webhook_events,"
+            " operators, merchants, api_credentials, agent_credentials,"
+            " enrollment_challenges, spending_consents, consent_publishers"
             " RESTART IDENTITY CASCADE"
         )
+
+
+# The four switches whose *production* default is closed, and which the bulk
+# of this suite predates.
+#
+# Phase 2 changed each of these defaults from permissive to secure:
+#
+#   DEMO_OPEN_DASHBOARD   /ledger/summary, /economics and /ledger/events used
+#                         to answer anyone. They now require an API key.
+#   ALLOW_HMAC_FALLBACK   an unregistered agent could pay with a shared-secret
+#                         MAC. Registration is now required.
+#   DEMO_UNSAFE_TOFU      anyone could bind a key to an unclaimed agent id by
+#                         being first. Enrollment now needs an authenticated
+#                         operator and proof of possession.
+#   REQUIRE_CONSENT       an agent could spend with no operator behind it.
+#                         A consent is now required to incur any expense.
+#
+# The existing tests exercise the *payment flow* — negotiation, double-spend,
+# batching, webhooks — and are not about authorization. Rewriting all of them
+# to carry bearer tokens would obscure what each is actually asserting without
+# testing anything new, so they run under the legacy profile.
+#
+# The secure defaults are not therefore untested: `tests/test_control_plane.py`
+# builds the facilitator with this fixture disabled and asserts, endpoint by
+# endpoint, that each one refuses an unauthenticated caller and refuses a
+# caller from the wrong tenant. Opting *out* of the demo profile is how a test
+# declares it is about authorization.
+LEGACY_DEMO_PROFILE = {
+    "DEMO_OPEN_DASHBOARD": "true",
+    "ALLOW_HMAC_FALLBACK": "true",
+    "DEMO_UNSAFE_TOFU": "true",
+    # An agent with no operator consent may still spend. The fourth switch,
+    # and the one that matters most: with it on, /offer and /settle refuse any
+    # agent that no operator has authorised.
+    "REQUIRE_CONSENT": "false",
+}
+
+
+@pytest.fixture(autouse=True)
+def legacy_demo_profile(request, monkeypatch):
+    """Runs the pre-Phase-2 permissive profile, unless a test opts out.
+
+    Mark a test or class with `@pytest.mark.secure_defaults` to get the
+    production configuration instead — closed dashboard, no HMAC fallback, no
+    trust-on-first-use, and consent required.
+    """
+    if request.node.get_closest_marker("secure_defaults"):
+        # Explicitly clear rather than merely not setting them: a stray value
+        # in the developer's own environment must not be able to turn a
+        # security test into a passing no-op.
+        for name in LEGACY_DEMO_PROFILE:
+            monkeypatch.delenv(name, raising=False)
+        return
+
+    for name, value in LEGACY_DEMO_PROFILE.items():
+        monkeypatch.setenv(name, value)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "secure_defaults: run with the production-like closed configuration "
+        "rather than the permissive demo profile",
+    )
 
 
 @pytest.fixture

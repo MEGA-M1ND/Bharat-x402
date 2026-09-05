@@ -466,7 +466,10 @@ class X402Agent:
         print()
         print(rule())
         deferred = (receipt or {}).get("extra", {}).get("settlementMode") == "deferred"
-        print(f"  Paid {bold(paise_to_rupees(amount_paise))} in 4 HTTP requests.")
+        # "Committed", not "Paid" — the next line of this very summary says no
+        # rupees have moved, and printing both was the conflation this project
+        # exists to argue against, in its own demo output.
+        print(f"  Committed {bold(paise_to_rupees(amount_paise))} in 4 HTTP requests.")
         if deferred:
             print(dim("  No rupees have moved yet. This fetch is one line in a batch"))
             print(dim("  that becomes a single Razorpay Payment Link at end of day —"))
@@ -564,7 +567,9 @@ def main() -> int:
                 txn = (result["receipt"] or {}).get("transaction", "—")
                 print(
                     f"  {index + 1:>3}. {agent_id:<24} "
-                    f"{paise_to_rupees(result['amountPaise']):>8}  {green('paid')}  {dim(txn)}"
+                    f"{paise_to_rupees(result['amountPaise']):>8}  "
+                    # "owed", not "paid": this column is a receivable id.
+                    f"{green('owed')}  {dim(txn)}"
                 )
         except PaymentRefused as exc:
             failures += 1
@@ -580,7 +585,7 @@ def main() -> int:
         print()
         print(rule())
         print(
-            f"  {args.count - failures}/{args.count} fetches paid, "
+            f"  {args.count - failures}/{args.count} fetches served, "
             f"{bold(paise_to_rupees(total_paise))} committed."
         )
         print(dim("  Run reporting/daily_summary.py to see what the publisher gets."))
